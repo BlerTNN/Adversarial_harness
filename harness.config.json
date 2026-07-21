@@ -1,0 +1,42 @@
+{
+  "workspace": "workspace",
+  "default_agent": "hermes",
+  "worker_agent": null,
+  "reviewer_agent": null,
+  "max_reviews": 3,
+  "timeout_seconds": 5400,
+  "agents": {
+    "hermes": {
+      "description": "Hermes CLI; provider and model come from the user's existing Hermes configuration.",
+      "detect": ["hermes"],
+      "tui": ["hermes", "chat", "--tui"],
+      "command": ["hermes", "chat", "--quiet", "--toolsets", "terminal,file,browser,vision,web", "--max-turns", "90", "--yolo", "--accept-hooks", "--source", "harness-child", "-q", "{prompt}"]
+    },
+    "codex": {
+      "description": "OpenAI Codex CLI using stdin for the non-interactive prompt.",
+      "detect": ["codex"],
+      "tui": ["codex"],
+      "command": ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--cd", "{workspace}", "--add-dir", "{run_dir}", "--skip-git-repo-check", "-"],
+      "stdin": "{prompt}"
+    },
+    "cursor": {
+      "description": "Cursor Agent CLI in non-interactive print mode.",
+      "detect": ["cursor-agent"],
+      "tui": ["cursor-agent"],
+      "command": ["cursor-agent", "-p", "--force", "--output-format", "text", "{prompt}"]
+    },
+    "copilot": {
+      "description": "GitHub Copilot CLI with unattended tool approval.",
+      "detect": ["copilot"],
+      "tui": ["copilot"],
+      "command": ["copilot", "--autopilot", "--yolo", "--max-autopilot-continues", "10", "-p", "{prompt}", "-s", "--no-ask-user"]
+    },
+    "claude": {
+      "description": "Claude Code print mode with permission prompts skipped for unattended work.",
+      "detect": ["claude"],
+      "tui": ["claude"],
+      "command": ["claude", "--print", "--dangerously-skip-permissions", "--add-dir={run_dir}"],
+      "stdin": "{prompt}"
+    }
+  }
+}
