@@ -620,7 +620,13 @@ class HarnessControlTests(unittest.TestCase):
     def test_windows_stop_preserves_a_live_unmanaged_orphan_identity(self):
         run_dir = self.environment.create_run("Refuse unsafe PID-only termination.")
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        self.addCleanup(lambda: child.poll() is None and child.kill())
+
+        def cleanup_child() -> None:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+        self.addCleanup(cleanup_child)
         state = harness.read_json(run_dir / "state.json")
         state["active_agent"] = {
             "profile": "legacy",

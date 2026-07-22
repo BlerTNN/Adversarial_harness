@@ -620,7 +620,7 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse((run_dir / "review-schema.json").exists())
 
     def test_review_v2_plans_runs_checks_adjudicates_and_promotes(self):
-        self.environment.enable_review_v2(max_log_bytes_per_step=16)
+        self.environment.enable_review_v2(max_log_bytes_per_step=20)
         self.environment.set_verification(
             [[sys.executable, "-c", "import os; assert 'HARNESS_TEST_SECRET' not in os.environ"]]
         )
@@ -664,7 +664,7 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse(step["stderr_truncated"])
         stdout_path = review_dir / step["stdout_path"]
         stderr_path = review_dir / step["stderr_path"]
-        self.assertEqual(stdout_path.stat().st_size, 16)
+        self.assertEqual(stdout_path.stat().st_size, 20)
         self.assertIn("stderr-evidence", stderr_path.read_text(encoding="utf-8"))
         self.assertEqual(harness._file_sha256(stdout_path), step["stdout_sha256"])
         self.assertFalse((self.environment.workspace / "review-check-only.txt").exists())

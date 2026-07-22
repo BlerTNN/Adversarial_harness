@@ -25,7 +25,7 @@ class PlatformSupportTests(unittest.TestCase):
                 cwd=Path(temporary) / "candidate",
             )
 
-        self.assertEqual(actual, "/trusted/path/tool")
+        self.assertEqual(actual, str(Path("/trusted/path/tool").resolve()))
         which.assert_called_once_with("tool")
 
     def test_bare_program_resolution_freezes_relative_path_entries(self):
