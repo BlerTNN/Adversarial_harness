@@ -41,7 +41,7 @@ By default, the worker and reviewer inherit the root TUI's agent profile, but th
 
 You need:
 
-- Python 3;
+- Python 3.10+ on macOS or Linux;
 - at least one installed and authenticated coding-agent CLI;
 - a trusted local directory, because the built-in worker profiles run unattended.
 
@@ -60,11 +60,11 @@ The default `workspace/` keeps task output separate from Harness source. To have
 
 The root agent checks the current state first. When no unfinished run exists, it records the original goal, constraints, and necessary assumptions in `.harness-request.md`, then submits that file to the controller. Clear requests are not turned into a questionnaire; the agent asks one short question only when missing information would materially change the result.
 
-Every run has isolated state, logs, review history, and a final report. Delivered files remain in the configured persistent `workspace/`, so later tasks can improve earlier work. Run records live under `runs/` and never overwrite previous tasks.
+Every run has isolated state, logs, review history, and a final report. Delivered files remain in the configured persistent `workspace/`, so later tasks can improve earlier work. Run records live under `runs/` and never overwrite previous tasks. A successful review records a content-addressed artifact manifest, and the final report identifies the exact workspace contents that passed.
 
 Handoffs do not depend on a specific CLI's terminal format. The worker maintains `PLAN.md` and writes `WORKER_RESULT.json` after every attempt. The reviewer writes `AUDIT.json` in an isolated review directory. The Harness archives these structured files and uses them to decide PASS, FIX, and where a resumed run should continue.
 
-Only one active run is accepted at a time:
+Only one active run is accepted at a time, including when callers choose different run directories:
 
 - a duplicate submission is rejected while an unfinished run exists;
 - a new request can start immediately after COMPLETE or INCOMPLETE;
@@ -108,7 +108,7 @@ In the root TUI, say “status”, “stop”/“pause”, or “continue”/“
 ./harness_control.py continue
 ```
 
-`stop` terminates the current child agent while preserving the workspace, phase, and review records already written to disk. It cannot guarantee an additional session summary before termination. `continue` resumes that exact run and restarts the appropriate saved profile. Never submit the old request with `start`, because that creates a duplicate task.
+`stop` terminates the current child agent while preserving the workspace, phase, and review records already written to disk. It also terminates an orphan child left behind by a crashed supervisor. `continue` refuses to create a duplicate while that child is alive, then resumes the exact saved run after it is stopped. It cannot guarantee an additional session summary before termination. Never submit the old request with `start`, because that creates a duplicate task.
 
 Plain CLI output follows `HARNESS_LANG` when set, then the system locale. Override it explicitly when needed:
 
@@ -117,15 +117,15 @@ HARNESS_LANG=en ./harness_control.py status
 HARNESS_LANG=zh-CN ./harness_control.py status
 ```
 
-For a read-only local dashboard, run `python3 status_dashboard.py` and open the address printed in the terminal. The page can switch between English and Chinese. It is optional and has no control buttons.
+For a read-only local dashboard, run `python3 status_dashboard.py` and open the address printed in the terminal. The page can switch between English and Chinese. It is optional, has no control buttons, and deliberately refuses non-loopback bindings. Use an SSH tunnel for remote viewing.
 
 ## Worker and reviewer rules
 
 The worker implements only the current request in the workspace. It inspects existing content, makes the smallest complete change, and runs checks appropriate to the task. On a FIX round, the same worker profile resumes from the persisted plan, result, and full audit, resolving every blocker, major, and minor issue. Minor issues alone do not trigger another repair round.
 
-The reviewer runs in an independent session and treats the workspace as read-only. It inspects the request, delivered files, and worker report, and performs suitable non-destructive checks. It does not force UI checks onto a script or game-specific checks onto an unrelated website. Only blocker and major findings trigger FIX; minor findings are reported without blocking PASS. The default review limit is three rounds.
+The reviewer runs in an independent session against a disposable copy of the delivered workspace. Review caches, builds, and accidental edits therefore cannot change the live delivery. The Harness fingerprints live file contents before and after review and records the accepted SHA-256 artifact ID. It inspects the request, delivered files, and worker report, and performs suitable checks. A failed check or any blocker/major finding prevents PASS. Minor findings may be reported without blocking PASS when the reviewer itself returns PASS. The Harness never rewrites an explicit FIX into PASS. The default review limit is three rounds.
 
-“Read-only” means the Harness detects and rejects net reviewer changes to the workspace; it is not an operating-system sandbox. Use only trusted local agent profiles. Review checks that create caches or build files should redirect them to the review directory or a temporary directory and leave the workspace unchanged.
+The snapshot and integrity checks are not an operating-system sandbox. Built-in profiles still run with the current user's permissions and can access other local paths or the network. Use only trusted local agent profiles and trusted requests. See [SECURITY.md](SECURITY.md) for the complete trust model.
 
 The complete role prompts are [worker.md](prompts/worker.md) and [reviewer.md](prompts/reviewer.md).
 
@@ -142,7 +142,7 @@ Important fields in [harness.config.json](harness.config.json):
 | `max_reviews` | `3` | Maximum FIX/review rounds |
 | `timeout_seconds` | `5400` | Timeout for one agent invocation |
 
-The configuration does not store credentials. Each agent CLI manages its own authentication. Never place tokens, `.env` contents, or authorization headers in a request, prompt, log, or profile argv.
+The configuration does not store credentials. Each agent CLI manages its own authentication. Never place tokens, `.env` contents, or authorization headers in a request, prompt, log, or profile argv. Run records and raw CLI output are private local evidence files and may still contain task content.
 
 ## Development and verification
 
@@ -153,3 +153,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v
 ```
 
 Prompt variables and structured artifact schemas are documented in [prompts/README.en.md](prompts/README.en.md).
+
+## License
+
+Released under the [MIT License](LICENSE). Security reports should follow [SECURITY.md](SECURITY.md).

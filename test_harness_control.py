@@ -2,6 +2,8 @@ import json
 import fcntl
 import io
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -76,6 +78,20 @@ class HarnessControlTests(unittest.TestCase):
             harness_control.start(self.start_args("Do not create this duplicate."))
 
         self.assertEqual(harness_control.generic_runs(self.environment.runs), [existing])
+
+    def test_unfinished_current_run_blocks_a_different_runs_directory(self):
+        existing = self.environment.create_run("Keep the global task queued.")
+        harness_control.write_current(existing, self.environment.runs)
+
+        with self.assertRaisesRegex(harness_control.ControlError, "unfinished task"):
+            harness_control.start(
+                self.start_args(
+                    "Do not start in another runs directory.",
+                    runs_dir=self.root / "other-runs",
+                )
+            )
+
+        self.assertFalse((self.root / "other-runs").exists())
 
     def test_stop_then_continue_resumes_the_exact_run(self):
         run_dir = self.environment.create_run("Build a resumable task.")
@@ -153,6 +169,36 @@ class HarnessControlTests(unittest.TestCase):
 
         self.assertTrue((run_dir / harness.PAUSE_FILE).is_file())
         self.assertEqual(harness.read_json(run_dir / "state.json")["status"], "QUEUED")
+
+    def test_continue_refuses_a_live_orphan_child_and_stop_terminates_it(self):
+        run_dir = self.environment.create_run("Recover without duplicate workers.")
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        state = harness.read_json(run_dir / "state.json")
+        state["active_agent"] = {
+            "profile": "alpha",
+            "role": "TASK_WORKER",
+            "pid": child.pid,
+            "process_group": child.pid,
+            "pid_started": harness.pid_start_time(child.pid),
+        }
+        harness.write_json(run_dir / "state.json", state)
+        current = patch.object(harness_control, "current_run", return_value=run_dir)
+        current.start()
+        self.addCleanup(current.stop)
+
+        with self.assertRaisesRegex(harness_control.ControlError, "still running"):
+            harness_control.continue_run(SimpleNamespace(foreground=True))
+        self.assertIsNone(child.poll())
+
+        self.assertEqual(harness_control.stop_run(), 0)
+        child.wait(timeout=5)
+        stopped = harness.read_json(run_dir / "state.json")
+        self.assertEqual(stopped["status"], "PAUSED")
+        self.assertIsNone(stopped["active_agent"])
 
 
 if __name__ == "__main__":

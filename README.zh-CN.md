@@ -41,7 +41,7 @@ claude
 
 需要：
 
-- Python 3；
+- macOS 或 Linux 上的 Python 3.10+；
 - 至少一个已安装、已登录的 coding-agent CLI；
 - 一个你信任的本地目录，因为内置 worker profile 采用无人值守权限完成任务。
 
@@ -60,11 +60,11 @@ hermes --version       # 或 codex / cursor-agent / copilot / claude
 
 根 Agent 会先读取当前状态。没有未结束任务时，它会把你的原始目标、约束和必要假设整理到 `.harness-request.md`，再交给控制器。明确的需求不会被追问成一张表；只有缺失信息会实质改变结果时才需要一个简短问题。
 
-每个 run 都有独立状态、日志、审查历史和最终报告。实现结果保存在配置指定的持久 `workspace/` 中，因此后续任务可以继续改进前一项成果。运行记录保存在 `runs/`，不会覆盖以前的任务。
+每个 run 都有独立状态、日志、审查历史和最终报告。实现结果保存在配置指定的持久 `workspace/` 中，因此后续任务可以继续改进前一项成果。运行记录保存在 `runs/`，不会覆盖以前的任务。审查通过时会保存基于内容的 artifact 清单，最终报告可以指出准确通过审查的 workspace 内容。
 
 跨 CLI 的交接不依赖终端输出格式。Worker 持续更新 run 中的 `PLAN.md`，并在每轮结束写 `WORKER_RESULT.json`；Reviewer 在独立 review 目录写 `AUDIT.json`。Harness 会归档每轮结果并以这些结构化文件决定 PASS、FIX 和恢复位置。
 
-Harness 同一时间只认领一个活动 run：
+Harness 同一时间只认领一个活动 run，即使调用方选择了不同的 runs 目录：
 
 - 活动任务存在时，重复提交会被拒绝；
 - COMPLETE 或 INCOMPLETE 后可以立即提交下一句话；
@@ -108,9 +108,9 @@ Harness 优先识别当前根 TUI Agent；无法识别时才使用 `default_agen
 ./harness_control.py continue
 ```
 
-`stop` 会终止当前子 Agent，并保留已经写入磁盘的 workspace、阶段和审查记录；它不能保证 Agent 在被终止前额外输出一份会话总结。`continue` 只恢复同一个 run，并从这些持久文件重新启动对应 profile。不要用旧需求再次执行 `start`，否则会产生重复任务。
+`stop` 会终止当前子 Agent，并保留已经写入磁盘的 workspace、阶段和审查记录；Supervisor 崩溃后遗留的孤儿子进程也会被终止。旧子进程仍存活时，`continue` 会拒绝重复启动，停止后才恢复同一个 run。它不能保证 Agent 在被终止前额外输出一份会话总结。不要用旧需求再次执行 `start`，否则会产生重复任务。
 
-如需本机浏览器中的只读状态页，可运行 `python3 status_dashboard.py`，再打开终端显示的地址。页面可在中文和 English 之间切换；它不是完成任务所必需的，也不提供修改或控制按钮。
+如需本机浏览器中的只读状态页，可运行 `python3 status_dashboard.py`，再打开终端显示的地址。页面可在中文和 English 之间切换；它不是完成任务所必需的，也不提供修改或控制按钮。Dashboard 会拒绝非本机监听地址；远程查看请使用 SSH 隧道。
 
 CLI 文本会根据 `HARNESS_LANG` 或系统 locale 选择中文或英文。需要显式覆盖时：
 
@@ -123,9 +123,9 @@ HARNESS_LANG=en ./harness_control.py status
 
 Worker 只在 workspace 中实施当前需求，先检查已有内容，再做最小完整改动并运行与任务匹配的验证。收到 FIX 后继续使用同一 worker profile，并从持久计划、结果和完整审计文件恢复上下文；该修复轮会同时处理审计中的全部 blocker、major 和 minor，并逐项验证可执行的验收检查。minor 单独存在时仍不会触发修复轮。
 
-Reviewer 使用独立会话，只读检查需求、产物和 worker 的验证结果。它应实际运行适合该任务的非破坏性检查，但不会把网站任务强制套成浏览器游戏测试，也不会把普通脚本任务强制套成 UI 审查。只有 blocker/major 问题触发 FIX；minor 会进入报告但不阻止 PASS。默认最多审查三轮。
+Reviewer 使用独立会话，在实际交付结果的一份临时副本中检查需求、产物和 worker 的验证结果。审查产生的缓存、构建文件或误修改不会影响真实 workspace。Harness 会在审查前后计算真实文件内容哈希，并记录通过审查的 SHA-256 artifact ID。Reviewer 应实际运行适合任务的检查，但不会把网站任务强制套成浏览器游戏测试，也不会把普通脚本任务强制套成 UI 审查。检查失败或 blocker/major 问题都会阻止 PASS；reviewer 明确给出的 FIX 不会被 Harness 改成 PASS。默认最多审查三轮。
 
-这里的“只读”是 Harness 会检测并拒绝 reviewer 对 workspace 的净修改，不是操作系统级安全沙箱；profile 仍应只使用你信任的本地 Agent 和权限。Reviewer 运行会生成缓存或构建文件的检查时，应把输出放到 review 目录或临时目录，结束前保持 workspace 与审查前一致。
+临时副本和完整性检查仍不是操作系统级安全沙箱。内置 profile 使用当前用户权限运行，仍可能访问其他本机路径和网络。只使用可信的本地 Agent 与可信需求；完整边界见 [SECURITY.md](SECURITY.md)。
 
 两个角色的完整约束分别在 [worker.md](prompts/worker.md) 和 [reviewer.md](prompts/reviewer.md)。
 
@@ -142,7 +142,7 @@ Reviewer 使用独立会话，只读检查需求、产物和 worker 的验证结
 | `max_reviews` | `3` | FIX/复审上限 |
 | `timeout_seconds` | `5400` | 单次 Agent 调用超时 |
 
-配置不存放密钥。凭据仍由各 Agent CLI 自己管理；不要把 token、`.env` 内容或授权头写进需求、Prompt、日志或 profile argv。
+配置不存放密钥。凭据仍由各 Agent CLI 自己管理；不要把 token、`.env` 内容或授权头写进需求、Prompt、日志或 profile argv。Run 记录和 CLI 原始输出是本机私有证据文件，但仍可能包含任务内容。
 
 ## 开发与验证
 
@@ -153,3 +153,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v
 ```
 
 Prompt 变量说明见 [prompts/README.md](prompts/README.md)。
+
+## 许可证
+
+本项目使用 [MIT License](LICENSE)。安全问题请按 [SECURITY.md](SECURITY.md) 报告。

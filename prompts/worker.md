@@ -46,6 +46,7 @@ continue this same task and role.
 Before finishing, write valid UTF-8 JSON to `{run_dir}/WORKER_RESULT.json` with
 all of these fields:
 
+- `schema_version`: exactly `generic-harness/worker-result/v1`;
 - `status`: `complete` or `blocked`;
 - `summary`: concise factual string;
 - `changed_files`: array of workspace-relative paths;
@@ -54,7 +55,8 @@ all of these fields:
 - `limitations`: array of strings.
 
 Use empty arrays when appropriate. Report only checks actually performed. Do not
-put Markdown fences around the JSON and do not include secrets.
+report `complete` while any check has status `fail`. Put no Markdown fences
+around the JSON and do not include secrets.
 
 Finish with a concise factual report: what changed, checks actually run and
 their results, and any genuine blocker or remaining limitation. Never claim a

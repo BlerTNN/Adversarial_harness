@@ -34,6 +34,7 @@ STATE_FIELDS = (
     "review_index",
     "max_reviews",
     "active_agent",
+    "artifact_id",
     "last_error",
     "created_at",
     "updated_at",
@@ -64,6 +65,16 @@ def redact(text: str) -> str:
     text = SECRET_ASSIGNMENT.sub(r"\1[REDACTED]", text)
     text = BEARER_TOKEN.sub("Bearer [REDACTED]", text)
     return SECRET_TOKEN.sub("[REDACTED]", text)
+
+
+def redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {key: redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item) for item in value]
+    return value
 
 
 def clean_dialogue_text(text: str) -> str:
@@ -118,7 +129,7 @@ def load_run(run_dir: Path) -> dict[str, Any] | None:
     state = read_json(state_path)
     if not state or state.get("schema_version") != SCHEMA_VERSION:
         return None
-    record = {field: state.get(field) for field in STATE_FIELDS}
+    record = {field: redact_value(state.get(field)) for field in STATE_FIELDS}
     record["run_id"] = str(state.get("run_id") or run_dir.name)
     record["report_available"] = (run_dir / "FINAL_REPORT.md").is_file()
     record["_sort"] = timestamp(state.get("created_at")) or file_mtime(state_path)
@@ -239,6 +250,8 @@ class Handler(BaseHTTPRequestHandler):
 def make_server(
     root: Path = ROOT, host: str = "127.0.0.1", port: int = 8787
 ) -> ThreadingHTTPServer:
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise ValueError("The unauthenticated dashboard may only listen on localhost; use an SSH tunnel for remote access.")
     server = ThreadingHTTPServer((host, port), Handler)
     server.dashboard_root = Path(root)  # type: ignore[attr-defined]
     return server
@@ -249,7 +262,10 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
-    server = make_server(ROOT, args.host, args.port)
+    try:
+        server = make_server(ROOT, args.host, args.port)
+    except ValueError as error:
+        parser.error(str(error))
     print(f"Harness status dashboard: http://{args.host}:{args.port}", flush=True)
     server.serve_forever()
 

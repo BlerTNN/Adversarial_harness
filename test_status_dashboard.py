@@ -47,6 +47,7 @@ class StatusDashboardTests(unittest.TestCase):
                 phase="review",
                 active_agent="agent-c",
                 review_index=1,
+                last_error="authorization=do-not-expose",
             )
             legacy = root / "runs" / "legacy"
             legacy.mkdir()
@@ -86,6 +87,7 @@ class StatusDashboardTests(unittest.TestCase):
             combined = "\n".join(log["text"] for log in payload["current"]["logs"])
             self.assertIn("[REDACTED]", combined)
             self.assertNotIn("do-not-show", combined)
+            self.assertEqual(payload["current"]["last_error"], "authorization=[REDACTED]")
 
     def test_status_payload_is_empty_without_valid_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -127,6 +129,10 @@ class StatusDashboardTests(unittest.TestCase):
         self.assertNotIn("Codex", status_dashboard.PAGE)
         self.assertNotIn("Hermes", status_dashboard.PAGE)
         self.assertNotIn("知识游戏", status_dashboard.PAGE)
+
+    def test_dashboard_refuses_non_loopback_binding(self):
+        with self.assertRaisesRegex(ValueError, "localhost"):
+            status_dashboard.make_server(Path.cwd(), "0.0.0.0", 0)
 
 
 if __name__ == "__main__":

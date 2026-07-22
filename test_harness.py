@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -27,6 +28,7 @@ event = {
     "profile": profile,
     "role": role,
     "index": index,
+    "workspace": str(workspace),
     "prompt": str(prompt_path.relative_to(run_dir)),
 }
 with (run_dir / "fake-processes.jsonl").open("a", encoding="utf-8") as stream:
@@ -48,7 +50,10 @@ if role == "TASK_WORKER":
         f"<!doctype html><title>Shop</title><main data-round='{index + 1}'>Storefront and cart</main>\n",
         encoding="utf-8",
     )
+    if scenario.get("worker_unreported_file"):
+        (workspace / "unreported.txt").write_text("missing from handoff\n", encoding="utf-8")
     result = {
+        "schema_version": "generic-harness/worker-result/v1",
         "status": "blocked" if mode == "blocked" else "complete",
         "summary": f"Implemented the requested website in round {index + 1}.",
         "changed_files": ["index.html"],
@@ -56,7 +61,7 @@ if role == "TASK_WORKER":
             {
                 "name": "fixture check",
                 "command": "inspect index.html",
-                "status": "pass",
+                "status": "fail" if mode == "failed_check" else "pass",
                 "details": "Storefront exists.",
             }
         ],
@@ -112,14 +117,20 @@ if scenario.get("minor_only"):
     issues[0]["severity"] = "minor"
 if scenario.get("reviewer_modifies_workspace"):
     (workspace / "reviewer-touched.txt").write_text("not allowed\n", encoding="utf-8")
+if scenario.get("reviewer_modifies_live_workspace"):
+    (Path(state["workspace"]) / "reviewer-touched.txt").write_text("not allowed\n", encoding="utf-8")
+if scenario.get("agent_tampers_state"):
+    state["request"] = "tampered"
+    (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
 audit = {
+    "schema_version": "generic-harness/audit/v1",
     "verdict": verdict,
     "summary": "Checkout needs repair." if verdict == "FIX" else "Independent checks passed.",
     "checks": [
         {
             "name": "independent fixture check",
             "command": "inspect index.html",
-            "status": "fail" if verdict == "FIX" else "pass",
+            "status": "fail" if verdict == "FIX" or scenario.get("audit_failed_check") else "pass",
             "details": "Observed the delivered workspace.",
         }
     ],
@@ -221,6 +232,14 @@ class HarnessTests(unittest.TestCase):
         self.assertNotEqual(events[0]["pid"], events[1]["pid"])
         self.assertEqual(harness.read_json(run_dir / "reviews" / "00" / "AUDIT.json")["verdict"], "PASS")
         self.assertTrue((self.environment.workspace / "index.html").is_file())
+        self.assertEqual(len(state["artifact_id"]), 64)
+        artifact = harness.read_json(run_dir / state["artifact_path"])
+        self.assertEqual(artifact["sha256"], state["artifact_id"])
+        self.assertNotEqual(events[0]["workspace"], events[1]["workspace"])
+        self.assertFalse(Path(events[1]["workspace"]).exists())
+        self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((run_dir / "state.json").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE((run_dir / "iterations" / "00" / "worker.log").stat().st_mode), 0o600)
 
         prompts = "\n".join(
             path.read_text(encoding="utf-8")
@@ -319,7 +338,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(len(list((run_dir / "reviews").glob("*/AUDIT.json"))), 2)
         self.assertIn("INCOMPLETE", (run_dir / "FINAL_REPORT.md").read_text(encoding="utf-8"))
 
-    def test_forged_audit_never_skips_reviewer_and_reviewer_writes_are_blocking(self):
+    def test_forged_audit_never_skips_reviewer_and_review_uses_isolated_snapshot(self):
         forged = self.environment.create_run("Review the real delivery.")
         self.environment.set_scenario(forged, worker_prewrites_audit=True)
         self.assertEqual(harness.execute_run(forged), 0)
@@ -329,21 +348,66 @@ class HarnessTests(unittest.TestCase):
         )
         self.assertTrue(list((forged / "reviews" / "00").glob("AUDIT.invalid-*.json")))
 
-        modified = self.environment.create_run("Keep review read-only.", max_reviews=1)
-        self.environment.set_scenario(modified, reviewer_modifies_workspace=True)
+        isolated = self.environment.create_run("Keep the live delivery unchanged.")
+        self.environment.set_scenario(isolated, reviewer_modifies_workspace=True)
+        self.assertEqual(harness.execute_run(isolated), 0)
+        self.assertFalse((self.environment.workspace / "reviewer-touched.txt").exists())
+
+        modified = self.environment.create_run("Detect changes to the live delivery.", max_reviews=1)
+        self.environment.set_scenario(modified, reviewer_modifies_live_workspace=True)
         self.assertEqual(harness.execute_run(modified), 1)
         audit = harness.read_json(modified / "reviews" / "00" / "AUDIT.json")
         self.assertEqual(audit["verdict"], "FIX")
-        self.assertIn("Reviewer modified", audit["issues"][-1]["title"])
+        self.assertIn("workspace changed", audit["issues"][-1]["title"].lower())
 
-    def test_fix_with_only_minor_issues_is_normalized_to_pass(self):
-        run_dir = self.environment.create_run("Accept minor review notes.")
+    def test_explicit_fix_is_never_rewritten_to_pass(self):
+        run_dir = self.environment.create_run("Keep the reviewer's explicit verdict.", max_reviews=1)
         self.environment.set_scenario(run_dir, verdicts=["FIX"], minor_only=True)
 
-        self.assertEqual(harness.execute_run(run_dir), 0)
+        self.assertEqual(harness.execute_run(run_dir), 1)
 
-        self.assertEqual(harness.read_json(run_dir / "reviews" / "00" / "AUDIT.json")["verdict"], "PASS")
+        self.assertEqual(harness.read_json(run_dir / "reviews" / "00" / "AUDIT.json")["verdict"], "FIX")
         self.assertEqual(len(self.environment.events(run_dir)), 2)
+
+    def test_failed_checks_cannot_pass(self):
+        worker = self.environment.create_run("Reject a failed worker check.")
+        self.environment.set_scenario(worker, worker_mode="failed_check")
+        with self.assertRaisesRegex(harness.HarnessError, "failed check"):
+            harness.execute_run(worker)
+
+        reviewer = self.environment.create_run("Reject a failed reviewer check.", max_reviews=1)
+        self.environment.set_scenario(reviewer, audit_failed_check=True)
+        self.assertEqual(harness.execute_run(reviewer), 1)
+        self.assertEqual(harness.read_json(reviewer / "reviews" / "00" / "AUDIT.json")["verdict"], "FIX")
+
+    def test_worker_cannot_hide_changed_files(self):
+        run_dir = self.environment.create_run("Require a factual changed-file handoff.")
+        self.environment.set_scenario(run_dir, worker_unreported_file=True)
+
+        with self.assertRaisesRegex(harness.HarnessError, "omitted changed paths"):
+            harness.execute_run(run_dir)
+
+    def test_content_manifest_detects_same_size_change_with_restored_mtime(self):
+        self.environment.workspace.mkdir()
+        target = self.environment.workspace / "value.txt"
+        target.write_text("AAAA", encoding="utf-8")
+        details = target.stat()
+        before = harness._workspace_manifest(self.environment.workspace)
+        target.write_text("BBBB", encoding="utf-8")
+        os.utime(target, ns=(details.st_atime_ns, details.st_mtime_ns))
+        after = harness._workspace_manifest(self.environment.workspace)
+
+        self.assertNotEqual(before["sha256"], after["sha256"])
+        self.assertEqual(harness._manifest_changes(before, after), ["value.txt"])
+
+    def test_reviewer_cannot_modify_control_state(self):
+        run_dir = self.environment.create_run("Protect control state.")
+        self.environment.set_scenario(run_dir, agent_tampers_state=True)
+
+        with self.assertRaisesRegex(harness.HarnessError, "protected Harness control data"):
+            harness.execute_run(run_dir)
+
+        self.assertEqual(harness.read_json(run_dir / "state.json")["request"], "Protect control state.")
 
     def test_invalid_worker_or_audit_pauses_run(self):
         cases = (
@@ -367,7 +431,7 @@ class HarnessTests(unittest.TestCase):
         with self.assertRaises(harness.WorkerBlocked):
             harness.execute_run(run_dir)
 
-        self.assertEqual(harness.read_json(run_dir / "state.json")["status"], "PAUSED")
+        self.assertEqual(harness.read_json(run_dir / "state.json")["status"], "BLOCKED")
         self.assertTrue((run_dir / "iterations" / "00" / "WORKER_RESULT.blocked.json").is_file())
         self.environment.set_scenario(run_dir, worker_mode="valid")
         self.assertEqual(harness.execute_run(run_dir), 0)
@@ -382,6 +446,22 @@ class HarnessTests(unittest.TestCase):
         with self.assertRaisesRegex(harness.HarnessError, "legacy runs are not resumed"):
             harness.execute_run(run_dir)
         self.assertFalse((run_dir / "fake-processes.jsonl").exists())
+
+    def test_dangerously_broad_workspace_and_overlapping_runs_are_rejected(self):
+        with self.assertRaisesRegex(harness.HarnessError, "too broad"):
+            harness.create_run(
+                "Do not use the filesystem root.",
+                config_path=self.environment.config,
+                runs_dir=self.environment.runs,
+                workspace=Path("/"),
+            )
+        with self.assertRaisesRegex(harness.HarnessError, "runs_dir cannot be the workspace"):
+            harness.create_run(
+                "Keep control records outside delivery root.",
+                config_path=self.environment.config,
+                runs_dir=self.environment.workspace,
+                workspace=self.environment.workspace,
+            )
 
 
 if __name__ == "__main__":

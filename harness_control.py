@@ -21,6 +21,7 @@ from harness import (
     STATE_SCHEMA,
     TERMINAL_STATUSES,
     HarnessError,
+    active_agent_pid,
     append_event,
     atomic_write,
     create_run,
@@ -30,6 +31,7 @@ from harness import (
     now,
     read_json,
     request_pause,
+    terminate_process_group,
     write_json,
 )
 
@@ -162,6 +164,7 @@ def spawn_run(run_dir: Path) -> int:
     log_path = run_dir / "harness.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as log:
+        log_path.chmod(0o600)
         process = subprocess.Popen(
             [sys.executable, str(HARNESS), "--resume", str(run_dir)],
             cwd=ROOT,
@@ -185,7 +188,14 @@ def start(args: argparse.Namespace) -> int:
             raise ControlError(tr(f"Could not read request file: {error}", f"无法读取需求文件：{error}")) from error
     with CONTROL_LOCK.open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        existing = unfinished_run(args.runs_dir.expanduser().resolve())
+        existing = current_run(args.runs_dir)
+        if existing and str(safe_json(existing / "state.json").get("status", "")).upper() in TERMINAL_STATUSES:
+            existing = None
+        existing = (
+            existing
+            or unfinished_run(RUNS_DIR)
+            or unfinished_run(args.runs_dir.expanduser().resolve())
+        )
         if existing:
             state = safe_json(existing / "state.json")
             pid = supervisor_pid(existing)
@@ -262,6 +272,17 @@ def continue_run(args: argparse.Namespace) -> int:
                     "旧 Supervisor 尚未释放 run lock；暂停标记保持不变，请稍后再执行 continue。",
                 )
             )
+        active_pid = active_agent_pid(state)
+        if active_pid:
+            raise ControlError(
+                tr(
+                    f"The previous supervisor stopped but child agent PID {active_pid} is still running. Use stop, then continue.",
+                    f"旧 Supervisor 已停止，但子 Agent PID {active_pid} 仍在运行。请先 stop，再 continue。",
+                )
+            )
+        if state.get("active_agent") is not None:
+            state["active_agent"] = None
+            write_json(run_dir / "state.json", state)
         (run_dir / PAUSE_FILE).unlink(missing_ok=True)
         _state = read_json(run_dir / "state.json")
         _state.update({"status": "QUEUED", "last_error": "", "updated_at": now()})
@@ -287,6 +308,10 @@ def stop_run() -> int:
         request_pause(run_dir)
         pid = supervisor_pid(run_dir)
         if pid is None and run_lock_available(run_dir):
+            active = state.get("active_agent")
+            child_pid = active_agent_pid(state)
+            if child_pid and isinstance(active, dict):
+                terminate_process_group(child_pid, str(active.get("pid_started", "")))
             state.update({"status": "PAUSED", "active_agent": None, "updated_at": now()})
             write_json(run_dir / "state.json", state)
     print(tr(f"Safe pause requested: {run_dir}", f"已请求安全暂停：{run_dir}"))
@@ -306,11 +331,14 @@ def status_payload() -> dict[str, Any]:
         return {"schema_version": STATE_SCHEMA, "status": "IDLE", "run_dir": None, "harness_running": False}
     state = read_json(run_dir / "state.json")
     pid = supervisor_pid(run_dir)
+    child_pid = active_agent_pid(state)
     return {
         **state,
         "run_dir": str(run_dir),
         "harness_pid": pid,
         "harness_running": pid is not None,
+        "child_agent_running": child_pid is not None,
+        "child_agent_pid": child_pid,
         "operator_paused": (run_dir / PAUSE_FILE).is_file(),
         "final_report": str(run_dir / "FINAL_REPORT.md") if (run_dir / "FINAL_REPORT.md").is_file() else None,
     }
@@ -361,7 +389,9 @@ def wait_for_run(timeout: int, interval: float) -> int:
         if status == "IDLE":
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 0
-        if status in TERMINAL_STATUSES or (status == "PAUSED" and not payload.get("harness_running")):
+        if status in TERMINAL_STATUSES or (
+            status in {"PAUSED", "BLOCKED"} and not payload.get("harness_running")
+        ):
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 0 if status == "COMPLETE" else 1
         if deadline is not None and time.monotonic() >= deadline:
