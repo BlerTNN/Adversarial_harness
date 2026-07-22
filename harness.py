@@ -60,6 +60,7 @@ MAX_ARG_PROMPT_BYTES = 100_000
 MAX_WINDOWS_COMMAND_LINE = 30_000
 MAX_WINDOWS_BATCH_COMMAND_LINE = 8_000
 WINDOWS_BATCH_METACHARACTERS = "%!^&|<>()\r\n\""
+WINDOWS_RETRYABLE_REPLACE_ERRORS = {5, 32, 33}
 MAX_VERIFICATION_DETAILS = 8_000
 PROTECTED_STATE_FIELDS = (
     "schema_version",
@@ -143,7 +144,10 @@ def _replace_path(source: Path, destination: Path) -> None:
             original = destination.lstat()
             if not original.st_mode & stat.S_IWRITE:
                 break
-            if getattr(error, "winerror", None) in {32, 33} and time.monotonic() < retry_deadline:
+            if (
+                getattr(error, "winerror", None) in WINDOWS_RETRYABLE_REPLACE_ERRORS
+                and time.monotonic() < retry_deadline
+            ):
                 time.sleep(0.025)
                 continue
             raise PermissionError(f"Could not replace writable destination: {destination}") from error
@@ -154,7 +158,10 @@ def _replace_path(source: Path, destination: Path) -> None:
                 os.replace(source, destination)
                 return
             except PermissionError as error:
-                if getattr(error, "winerror", None) not in {32, 33} or time.monotonic() >= retry_deadline:
+                if (
+                    getattr(error, "winerror", None) not in WINDOWS_RETRYABLE_REPLACE_ERRORS
+                    or time.monotonic() >= retry_deadline
+                ):
                     raise
                 time.sleep(0.025)
     except BaseException:
@@ -832,19 +839,30 @@ def run_agent(
         set_private_permissions(log_path)
         log.write(f"\n[{now()}] {role} via {profile_name}\n$ {format_command(shown)}\n")
         log.flush()
+        stdin_stream = None
         try:
+            if stdin_value is not None:
+                stdin_stream = tempfile.TemporaryFile(mode="w+b")
+                stdin_stream.write(stdin_value.encode("utf-8"))
+                stdin_stream.seek(0)
             process = spawn_managed_process(
                 command,
                 cwd=workspace,
                 env=_isolated_process_environment(workspace),
-                stdin=subprocess.PIPE if stdin_value is not None else subprocess.DEVNULL,
+                stdin=stdin_stream if stdin_stream is not None else subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
             )
         except (OSError, RuntimeError) as error:
+            if stdin_stream is not None:
+                stdin_stream.close()
             raise HarnessError(f"Could not launch {profile_name}: {error}") from error
+        except BaseException:
+            if stdin_stream is not None:
+                stdin_stream.close()
+            raise
         try:
             process_started = managed_process_start_time(process)
             if not process_started:
@@ -867,7 +885,6 @@ def run_agent(
             started_monotonic = time.monotonic()
             paused = False
             timed_out = False
-            communication_started = False
             while process.poll() is None:
                 if pause_requested(run_dir):
                     paused = True
@@ -879,30 +896,13 @@ def run_agent(
                     break
                 wait_seconds = max(0.01, min(0.25, deadline - time.monotonic()))
                 try:
-                    if stdin_value is not None:
-                        process.communicate(
-                            input=None if communication_started else stdin_value,
-                            timeout=wait_seconds,
-                        )
-                        communication_started = True
-                    else:
-                        process.wait(timeout=wait_seconds)
+                    process.wait(timeout=wait_seconds)
                 except subprocess.TimeoutExpired:
-                    communication_started = communication_started or stdin_value is not None
-            if stdin_value is not None:
-                process.communicate()
+                    pass
             returncode = process.wait()
-            try:
-                _terminate(process, grace=1.0)
-            finally:
-                if process.stdin is not None:
-                    process.stdin.close()
+            _terminate(process, grace=1.0)
         except BaseException:
-            try:
-                _terminate(process)
-            finally:
-                if process.stdin is not None:
-                    process.stdin.close()
+            _terminate(process)
             if guard is not None:
                 guard["active_agent"] = None
             try:
@@ -910,6 +910,9 @@ def run_agent(
             except (OSError, HarnessError):
                 pass
             raise
+        finally:
+            if stdin_stream is not None:
+                stdin_stream.close()
 
     if guard is not None:
         guard["active_agent"] = None
@@ -1847,6 +1850,7 @@ def refresh_report(run_dir: Path) -> None:
 
 
 def execute_run(run_dir: Path) -> int:
+    configure_utf8_stdio()
     requested_run_dir = Path(os.path.abspath(run_dir.expanduser()))
     if not _is_real_directory(requested_run_dir):
         raise HarnessError(f"Not a real Harness run directory: {requested_run_dir}")

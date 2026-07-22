@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import harness
 import harness_control
+import platform_support
 from platform_support import WINDOWS, file_lock, process_group_kwargs
 from test_harness import FakeHarnessEnvironment
 
@@ -54,6 +55,21 @@ class HarnessControlTests(unittest.TestCase):
         }
         values.update(overrides)
         return SimpleNamespace(**values)
+
+    def detached_supervisor_available(self) -> bool:
+        if not WINDOWS:
+            return True
+        try:
+            platform_support._windows_detached_creation_flags()
+        except RuntimeError as error:
+            if "does not permit" in str(error):
+                return False
+            raise
+        return True
+
+    def require_detached_supervisor(self) -> None:
+        if not self.detached_supervisor_available():
+            self.skipTest("host Job Object forbids a detached Supervisor")
 
     def test_terminal_run_allows_a_second_distinct_run(self):
         self.assertEqual(harness_control.start(self.start_args("Build the first website.")), 0)
@@ -175,12 +191,13 @@ class HarnessControlTests(unittest.TestCase):
             )
 
     def test_stop_cannot_be_cancelled_by_a_worker_replacing_the_legacy_marker(self):
+        self.require_detached_supervisor()
         run_dir = self.environment.create_run("Stop even if a worker fights the visible pause marker.")
         self.environment.set_scenario(run_dir, worker_fights_pause=True)
         harness_control.write_current(run_dir, self.environment.runs)
         self.addCleanup(lambda: harness.clear_pause_request(run_dir))
 
-        harness_control.spawn_run(run_dir)
+        supervisor = harness_control.spawn_run(run_dir)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             active = harness.read_json(run_dir / "state.json").get("active_agent")
@@ -203,6 +220,14 @@ class HarnessControlTests(unittest.TestCase):
         self.assertEqual(state["status"], "PAUSED")
         self.assertIsNone(state["active_agent"])
         self.assertTrue(harness.pause_request_path(run_dir).is_file())
+        deadline = time.monotonic() + 5
+        while (
+            supervisor in harness_control._DETACHED_PROCESSES
+            and time.monotonic() < deadline
+        ):
+            harness_control._reap_detached_processes()
+            time.sleep(0.02)
+        self.assertNotIn(supervisor, harness_control._DETACHED_PROCESSES)
         self.assertTrue((run_dir / harness.PAUSE_FILE).is_dir())
 
     def test_status_reports_persisted_role_selection(self):
@@ -273,6 +298,25 @@ class HarnessControlTests(unittest.TestCase):
         self.assertEqual(state["status"], "PAUSED")
         self.assertIn("host Job does not allow breakaway", state["last_error"])
         self.assertFalse((run_dir / "harness.pid").exists())
+
+    @unittest.skipUnless(WINDOWS, "Windows restricted-Job foreground recovery")
+    def test_windows_restricted_host_job_recovers_the_same_run_in_foreground(self):
+        if self.detached_supervisor_available():
+            self.skipTest("host permits a detached Supervisor")
+        run_dir = self.environment.create_run("Recover a restricted Windows run in foreground.")
+
+        with self.assertRaisesRegex(
+            harness_control.ControlError,
+            "does not permit a detached Supervisor",
+        ):
+            harness_control.spawn_run(run_dir)
+
+        self.assertEqual(harness.read_json(run_dir / "state.json")["status"], "PAUSED")
+        self.assertFalse(harness.supervisor_marker_path(run_dir).exists())
+        self.assertFalse((run_dir / "harness.pid").exists())
+        self.assertEqual(harness.execute_run(run_dir), 0)
+        self.assertEqual(harness.read_json(run_dir / "state.json")["status"], "COMPLETE")
+        self.assertTrue((self.environment.workspace / "index.html").is_file())
 
     def test_supervisor_marker_publication_failures_stop_the_unpublished_process(self):
         real_write_json = harness_control.write_json
@@ -412,6 +456,7 @@ class HarnessControlTests(unittest.TestCase):
         self.assertIsNone(harness_control.supervisor_pid(run_dir))
 
     def test_detached_supervisor_completes_the_original_run(self):
+        self.require_detached_supervisor()
         run_dir = self.environment.create_run("Complete in the detached supervisor.")
         launcher = subprocess.run(
             [
@@ -450,6 +495,7 @@ class HarnessControlTests(unittest.TestCase):
         harness_control._reap_detached_processes()
 
     def test_fast_detached_supervisor_never_leaves_a_stale_marker(self):
+        self.require_detached_supervisor()
         for index in range(5):
             run_dir = self.environment.create_run(f"Finish immediately {index}.")
             state = harness.read_json(run_dir / "state.json")

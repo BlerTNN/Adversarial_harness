@@ -463,6 +463,38 @@ class HarnessTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assertIsNone(harness.read_json(run_dir / "state.json")["active_agent"])
 
+    def test_staged_stdin_is_closed_when_process_launch_is_interrupted(self):
+        run_dir = self.environment.create_run("Close staged stdin after an interrupted launch.")
+        staged_input = tempfile.TemporaryFile(mode="w+b")
+        profile = {
+            "command": [sys.executable, "-c", "pass"],
+            "stdin": "{prompt}",
+        }
+
+        with patch.object(
+            harness.tempfile,
+            "TemporaryFile",
+            return_value=staged_input,
+        ), patch.object(
+            harness,
+            "spawn_managed_process",
+            side_effect=KeyboardInterrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                harness.run_agent(
+                    run_dir=run_dir,
+                    profile_name="interrupted-stdin",
+                    profile=profile,
+                    role="TASK_WORKER",
+                    prompt="中文 prompt",
+                    prompt_path=run_dir / "interrupted-prompt.md",
+                    log_path=run_dir / "interrupted-stdin.log",
+                    timeout_seconds=5,
+                    workspace=run_dir / "candidate",
+                )
+
+        self.assertTrue(staged_input.closed)
+
     def test_managed_verifier_launch_safety_failure_pauses_with_recovery_evidence(self):
         run_dir = self.environment.create_run("Fail closed if verifier containment is unsafe.")
         real_spawn = harness.spawn_managed_process
@@ -607,6 +639,26 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(destination.stat().st_mode), original_mode)
         self.assertEqual(stat.S_IMODE(root.stat().st_mode), original_parent_mode)
         self.assertTrue(source.is_file())
+
+    def test_windows_writable_replace_retries_access_denied_without_chmod(self):
+        root = self.environment.root / "writable-replace"
+        root.mkdir()
+        source = root / "source.txt"
+        destination = root / "destination.txt"
+        source.write_text("new\n", encoding="utf-8")
+        destination.write_text("old\n", encoding="utf-8")
+        locked = PermissionError("simulated Windows share lock")
+        locked.winerror = 5
+
+        with patch.object(harness, "WINDOWS", True), patch.object(
+            harness.os,
+            "replace",
+            side_effect=(locked, None),
+        ) as replace, patch.object(harness, "_make_writable") as make_writable:
+            harness._replace_path(source, destination)
+
+        self.assertEqual(replace.call_count, 2)
+        make_writable.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Windows share-lock behavior")
     def test_windows_exclusive_share_lock_preserves_destination_until_retry(self):
