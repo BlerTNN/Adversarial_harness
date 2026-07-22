@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parent
-SCHEMA_VERSION = "generic-harness/v1"
+SCHEMA_VERSION = "generic-harness/v2"
 MAX_LOG_BYTES = 120_000
 MAX_LOG_LINES = 400
 MAX_LOG_FILES = 20
@@ -27,6 +27,7 @@ STATE_FIELDS = (
     "phase",
     "request",
     "workspace",
+    "candidate_workspace",
     "coordinator_agent",
     "coordinator_detection",
     "worker_agent",
@@ -111,6 +112,7 @@ def timestamp(value: Any) -> float:
 def run_log_paths(run_dir: Path) -> list[Path]:
     fixed = [path for path in (run_dir / "harness.log", run_dir / "events.jsonl") if path.is_file()]
     role_logs = list(run_dir.glob("iterations/*/worker.log"))
+    role_logs.extend(run_dir.glob("iterations/*/verification.log"))
     role_logs.extend(run_dir.glob("reviews/*/reviewer.log"))
     role_logs = sorted(role_logs, key=file_mtime, reverse=True)[: max(0, MAX_LOG_FILES - len(fixed))]
     return sorted({*fixed, *role_logs}, key=lambda path: (file_mtime(path), str(path)))
@@ -171,7 +173,7 @@ PAGE = r"""<!doctype html>
 <meta name="theme-color" content="#101827"><title>Generic Task Harness Status</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1020;--card:#151d31;--line:#2b3854;--text:#edf2ff;--muted:#aab6d1;--blue:#72a7ff;--green:#64dfa7;--red:#ff8290}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1050px;margin:auto;padding:18px}h1,h2,h3{margin:.2em 0}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.languages{display:flex;gap:6px}.languages button{color:var(--text);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 9px;cursor:pointer}.languages button[aria-pressed="true"]{border-color:var(--blue);color:var(--blue)}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}.card{grid-column:span 12;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}.third{grid-column:span 4}.badge{display:inline-block;border-radius:99px;padding:3px 9px;background:#263555}.running,.planning,.reviewing,.repairing{background:#17406d}.complete,.pass{background:#174735}.failed,.incomplete,.paused{background:#63313b}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#090e1a;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:420px;overflow:auto}.request{font-size:17px}.history{display:grid;gap:8px}.run{padding:9px;border:1px solid var(--line);border-radius:10px}@media(max-width:700px){.third{grid-column:span 12}main{padding:10px}.head{display:block}.languages{margin-top:10px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1050px;margin:auto;padding:18px}h1,h2,h3{margin:.2em 0}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.languages{display:flex;gap:6px}.languages button{color:var(--text);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 9px;cursor:pointer}.languages button[aria-pressed="true"]{border-color:var(--blue);color:var(--blue)}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}.card{grid-column:span 12;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}.third{grid-column:span 4}.badge{display:inline-block;border-radius:99px;padding:3px 9px;background:#263555}.running,.planning,.reviewing,.repairing,.promoting{background:#17406d}.complete,.pass{background:#174735}.failed,.incomplete,.paused{background:#63313b}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#090e1a;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:420px;overflow:auto}.request{font-size:17px}.history{display:grid;gap:8px}.run{padding:9px;border:1px solid var(--line);border-radius:10px}@media(max-width:700px){.third{grid-column:span 12}main{padding:10px}.head{display:block}.languages{margin-top:10px}}
 </style></head><body><main>
 <div class="head"><div><h1 id="title"></h1><div id="subtitle" class="muted"></div></div>
 <div class="languages" aria-label="Language"><button type="button" data-lang="zh" onclick="setLanguage('zh')">中文</button><button type="button" data-lang="en" onclick="setLanguage('en')">English</button></div></div>

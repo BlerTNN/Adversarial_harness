@@ -5,6 +5,8 @@
   "reviewer_agent": null,
   "max_reviews": 3,
   "timeout_seconds": 5400,
+  "verification_commands": [["python3", "-m", "compileall", "-q", "."]],
+  "verification_timeout_seconds": 600,
   "agents": {
     "hermes": {
       "description": "Hermes CLI; provider and model come from the user's existing Hermes configuration.",

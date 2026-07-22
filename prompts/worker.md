@@ -9,7 +9,7 @@ Authoritative user request:
 {request}
 ---
 
-Authorized writable workspace:
+Authorized isolated candidate workspace:
 {workspace}
 
 Run record:
@@ -25,7 +25,7 @@ feedback. Perform each listed acceptance test when possible, and report the
 exact limitation for any test that cannot be run. Minor issues do not trigger a
 repair pass by themselves, but must not be ignored once included in one.
 
-Inspect the existing workspace before deciding what to change. Preserve useful
+Inspect the existing candidate before deciding what to change. Preserve useful
 work from earlier runs, make reasonable in-scope assumptions, and implement the
 smallest complete result that satisfies the request. Do not stop at a plan or
 recommendations. Run task-appropriate checks and inspect the actual output when
@@ -42,6 +42,11 @@ and `{run_dir}/WORKER_RESULT.json`. Do not edit other Harness source,
 configuration, prompts, control state, or review evidence. Do not read or expose
 credentials or secret-bearing files. If resumed with “继续” or “continue”,
 continue this same task and role.
+
+The formal delivery workspace is intentionally not writable by this role. The
+Harness will run its configured verification commands against a disposable copy
+of this candidate and will promote the reviewed candidate only after every gate
+passes.
 
 Before finishing, write valid UTF-8 JSON to `{run_dir}/WORKER_RESULT.json` with
 all of these fields:
