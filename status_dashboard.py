@@ -116,6 +116,7 @@ def run_log_paths(run_dir: Path) -> list[Path]:
     fixed = [path for path in (run_dir / "harness.log", run_dir / "events.jsonl") if path.is_file()]
     role_logs = list(run_dir.glob("iterations/*/worker.log"))
     role_logs.extend(run_dir.glob("iterations/*/verification.log"))
+    role_logs.extend(run_dir.glob("reviews/*/planner.log"))
     role_logs.extend(run_dir.glob("reviews/*/reviewer.log"))
     role_logs = sorted(role_logs, key=file_mtime, reverse=True)[: max(0, MAX_LOG_FILES - len(fixed))]
     return sorted({*fixed, *role_logs}, key=lambda path: (file_mtime(path), str(path)))
@@ -135,6 +136,14 @@ def load_run(run_dir: Path) -> dict[str, Any] | None:
     if not state or state.get("schema_version") != SCHEMA_VERSION:
         return None
     record = {field: redact_value(state.get(field)) for field in STATE_FIELDS}
+    config = read_json(run_dir / "run-config.json") or {}
+    review_dir = run_dir / "reviews" / f"{int(state.get('review_index', 0)):02d}"
+    final_review = read_json(review_dir / "FINAL_REVIEW.json") or {}
+    record["review_protocol_version"] = config.get("review_protocol_version", 1)
+    verdict = final_review.get("verdict")
+    reasons = final_review.get("reason_codes")
+    record["final_review_verdict"] = redact_value(verdict if isinstance(verdict, str) else None)
+    record["final_review_reason_codes"] = redact_value(reasons if isinstance(reasons, list) else [])
     record["run_id"] = str(state.get("run_id") or run_dir.name)
     record["report_available"] = (run_dir / "FINAL_REPORT.md").is_file()
     record["_sort"] = timestamp(state.get("created_at")) or file_mtime(state_path)
@@ -176,15 +185,15 @@ PAGE = r"""<!doctype html>
 <meta name="theme-color" content="#101827"><title>Generic Task Harness Status</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1020;--card:#151d31;--line:#2b3854;--text:#edf2ff;--muted:#aab6d1;--blue:#72a7ff;--green:#64dfa7;--red:#ff8290}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1050px;margin:auto;padding:18px}h1,h2,h3{margin:.2em 0}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.languages{display:flex;gap:6px}.languages button{color:var(--text);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 9px;cursor:pointer}.languages button[aria-pressed="true"]{border-color:var(--blue);color:var(--blue)}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}.card{grid-column:span 12;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}.third{grid-column:span 4}.badge{display:inline-block;border-radius:99px;padding:3px 9px;background:#263555}.running,.planning,.reviewing,.repairing,.promoting{background:#17406d}.complete,.pass{background:#174735}.failed,.incomplete,.paused{background:#63313b}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#090e1a;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:420px;overflow:auto}.request{font-size:17px}.history{display:grid;gap:8px}.run{padding:9px;border:1px solid var(--line);border-radius:10px}@media(max-width:700px){.third{grid-column:span 12}main{padding:10px}.head{display:block}.languages{margin-top:10px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1050px;margin:auto;padding:18px}h1,h2,h3{margin:.2em 0}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.languages{display:flex;gap:6px}.languages button{color:var(--text);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 9px;cursor:pointer}.languages button[aria-pressed="true"]{border-color:var(--blue);color:var(--blue)}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}.card{grid-column:span 12;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}.third{grid-column:span 4}.badge{display:inline-block;border-radius:99px;padding:3px 9px;background:#263555}.running,.planning,.reviewing,.repairing,.promoting,.verifying,.planning_review,.running_review_checks,.adjudicating{background:#17406d}.complete,.pass{background:#174735}.failed,.incomplete,.paused,.fix,.inconclusive{background:#63313b}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#090e1a;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:420px;overflow:auto}.request{font-size:17px}.history{display:grid;gap:8px}.run{padding:9px;border:1px solid var(--line);border-radius:10px}@media(max-width:700px){.third{grid-column:span 12}main{padding:10px}.head{display:block}.languages{margin-top:10px}}
 </style></head><body><main>
 <div class="head"><div><h1 id="title"></h1><div id="subtitle" class="muted"></div></div>
 <div class="languages" aria-label="Language"><button type="button" data-lang="zh" onclick="setLanguage('zh')">中文</button><button type="button" data-lang="en" onclick="setLanguage('en')">English</button></div></div>
 <div id="error"></div><div id="app"></div>
 <script>
 const messages={
-  en:{title:'Generic Task Harness',pageTitle:'Generic Task Harness Status',subtitle:'Read-only local status · refreshes every 2 seconds',empty:'No Harness run records yet.',noOutput:'No output yet',waiting:'Waiting',coordinator:'Coordinator',worker:'Worker',reviewer:'Reviewer',active:'Active agent',reviewRound:'Review',history:'Run history',readError:'Could not read status: '},
-  zh:{title:'通用任务 Harness',pageTitle:'通用任务 Harness 状态',subtitle:'只读本地状态 · 每 2 秒自动刷新',empty:'尚无通用任务运行记录。',noOutput:'暂无输出',waiting:'等待',coordinator:'协调角色',worker:'执行角色',reviewer:'审计角色',active:'当前活动角色',reviewRound:'审计',history:'运行历史',readError:'无法读取状态：'}
+  en:{title:'Generic Task Harness',pageTitle:'Generic Task Harness Status',subtitle:'Read-only local status · refreshes every 2 seconds',empty:'No Harness run records yet.',noOutput:'No output yet',waiting:'Waiting',pending:'pending',coordinator:'Coordinator',worker:'Worker',reviewer:'Reviewer',active:'Active agent',reviewRound:'Review',reviewProtocol:'Review protocol',finalVerdict:'Harness verdict',reasons:'Reasons',history:'Run history',readError:'Could not read status: '},
+  zh:{title:'通用任务 Harness',pageTitle:'通用任务 Harness 状态',subtitle:'只读本地状态 · 每 2 秒自动刷新',empty:'尚无通用任务运行记录。',noOutput:'暂无输出',waiting:'等待',pending:'待定',coordinator:'协调角色',worker:'执行角色',reviewer:'审计角色',active:'当前活动角色',reviewRound:'审计',reviewProtocol:'审查协议',finalVerdict:'Harness 裁决',reasons:'原因',history:'运行历史',readError:'无法读取状态：'}
 };
 let lastPayload=null;
 let lang=(localStorage.getItem('harness-lang')||navigator.language||'en').toLowerCase().startsWith('zh')?'zh':'en';
@@ -201,12 +210,13 @@ function render(d){
   const logs=(c.logs||[]).map(function(x){return '<div class="card"><h3>'+esc(x.path)+'</h3><pre>'+esc(x.text||t('noOutput'))+'</pre></div>'}).join('');
   const history=(d.runs||[]).map(function(x){return '<div class="run"><span class="badge '+cls(x.status)+'">'+esc(x.status)+'</span> <b>'+esc(x.run_id)+'</b><div class="muted">'+esc(x.phase||'')+' · '+esc(x.request||'')+'</div></div>'}).join('');
   const active=c.active_agent&&typeof c.active_agent==='object'?[c.active_agent.profile,c.active_agent.role,c.active_agent.pid&&('PID '+c.active_agent.pid)].filter(Boolean).join(' · '):(c.active_agent||'—');
+  const review=c.review_protocol_version===2?'<div class="muted">'+t('reviewProtocol')+' v2 · '+t('finalVerdict')+': <span class="badge '+cls(c.final_review_verdict)+'">'+esc(c.final_review_verdict||t('pending'))+'</span>'+(c.final_review_reason_codes&&c.final_review_reason_codes.length?' · '+t('reasons')+': '+esc(c.final_review_reason_codes.join(', ')):'')+'</div>':'';
   document.querySelector('#app').innerHTML=
     '<section class="grid"><div class="card"><span class="badge '+cls(c.status)+'">'+esc(c.status)+'</span><h2>'+esc(c.phase||t('waiting'))+'</h2><div class="request">'+esc(c.request||'')+'</div>'+(c.last_error?'<p class="failed">'+esc(c.last_error)+'</p>':'')+'</div>'+
     '<div class="card third"><div class="muted">'+t('coordinator')+'</div><b>'+esc(c.coordinator_agent||'—')+'</b></div>'+
     '<div class="card third"><div class="muted">'+t('worker')+'</div><b>'+esc(c.worker_agent||'—')+'</b></div>'+
     '<div class="card third"><div class="muted">'+t('reviewer')+'</div><b>'+esc(c.reviewer_agent||'—')+'</b></div>'+
-    '<div class="card"><div class="muted">'+t('active')+'</div><b>'+esc(active)+'</b><div class="muted">Workspace: '+esc(c.workspace||'—')+' · '+t('reviewRound')+' '+esc((c.review_index||0)+1)+' / '+esc(c.max_reviews||0)+'</div></div>'+
+    '<div class="card"><div class="muted">'+t('active')+'</div><b>'+esc(active)+'</b><div class="muted">Workspace: '+esc(c.workspace||'—')+' · '+t('reviewRound')+' '+esc((c.review_index||0)+1)+' / '+esc(c.max_reviews||0)+'</div>'+review+'</div>'+
     logs+
     '<div class="card"><h3>'+t('history')+'</h3><div class="history">'+history+'</div></div></section>';
 }

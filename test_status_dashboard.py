@@ -66,9 +66,17 @@ class StatusDashboardTests(unittest.TestCase):
             worker.mkdir(parents=True)
             (worker / "worker.log").write_text("worker output\n", encoding="utf-8")
             (worker / "verification.log").write_text("verification output\n", encoding="utf-8")
-            reviewer = new / "reviews" / "00"
+            reviewer = new / "reviews" / "01"
             reviewer.mkdir(parents=True)
+            (new / "run-config.json").write_text(
+                json.dumps({"review_protocol_version": 2}), encoding="utf-8"
+            )
+            (reviewer / "planner.log").write_text("planner output\n", encoding="utf-8")
             (reviewer / "reviewer.log").write_text("review output\n", encoding="utf-8")
+            (reviewer / "FINAL_REVIEW.json").write_text(
+                json.dumps({"verdict": "INCONCLUSIVE", "reason_codes": ["TOOL_UNAVAILABLE"]}),
+                encoding="utf-8",
+            )
             (new / "FINAL_REPORT.md").write_text("# Done\n", encoding="utf-8")
 
             payload = status_dashboard.status_payload(root)
@@ -85,9 +93,13 @@ class StatusDashboardTests(unittest.TestCase):
                     "events.jsonl",
                     "iterations/00/worker.log",
                     "iterations/00/verification.log",
-                    "reviews/00/reviewer.log",
+                    "reviews/01/planner.log",
+                    "reviews/01/reviewer.log",
                 },
             )
+            self.assertEqual(payload["current"]["review_protocol_version"], 2)
+            self.assertEqual(payload["current"]["final_review_verdict"], "INCONCLUSIVE")
+            self.assertEqual(payload["current"]["final_review_reason_codes"], ["TOOL_UNAVAILABLE"])
             combined = "\n".join(log["text"] for log in payload["current"]["logs"])
             self.assertIn("[REDACTED]", combined)
             self.assertNotIn("do-not-show", combined)
@@ -130,6 +142,8 @@ class StatusDashboardTests(unittest.TestCase):
         self.assertIn("reviewer_agent", status_dashboard.PAGE)
         self.assertIn("Active agent", status_dashboard.PAGE)
         self.assertIn("当前活动角色", status_dashboard.PAGE)
+        self.assertIn("Harness verdict", status_dashboard.PAGE)
+        self.assertIn("Harness 裁决", status_dashboard.PAGE)
         self.assertNotIn("Codex", status_dashboard.PAGE)
         self.assertNotIn("Hermes", status_dashboard.PAGE)
         self.assertNotIn("知识游戏", status_dashboard.PAGE)

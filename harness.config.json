@@ -7,6 +7,32 @@
   "timeout_seconds": 5400,
   "verification_commands": [["{python}", "-m", "compileall", "-q", "."]],
   "verification_timeout_seconds": 600,
+  "review_protocol_version": 2,
+  "review_policy": {
+    "require_plan": true,
+    "require_requirement_coverage": true,
+    "require_worker_claim_coverage": true,
+    "max_dynamic_checks": 12,
+    "max_steps_per_check": 4,
+    "per_check_timeout_seconds": 600,
+    "total_check_timeout_seconds": 1800,
+    "max_log_bytes_per_step": 10485760,
+    "allowed_check_kinds": ["command", "inspection", "visual"],
+    "required_risk_categories": [
+      "functional_correctness",
+      "regression",
+      "error_handling",
+      "data_integrity",
+      "security",
+      "concurrency_lifecycle",
+      "portability",
+      "performance_resources",
+      "usability_accessibility",
+      "installation_configuration",
+      "documentation_contract",
+      "observability_recovery"
+    ]
+  },
   "agents": {
     "hermes": {
       "description": "Hermes CLI; provider and model come from the user's existing Hermes configuration.",

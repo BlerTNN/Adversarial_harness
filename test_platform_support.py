@@ -28,6 +28,13 @@ class PlatformSupportTests(unittest.TestCase):
         self.assertEqual(actual, "/trusted/path/tool")
         which.assert_called_once_with("tool")
 
+    def test_bare_program_resolution_freezes_relative_path_entries(self):
+        with patch.object(platform_support.shutil, "which", return_value="relative-bin/tool"):
+            actual = platform_support.resolve_program("tool", cwd=Path("candidate"))
+
+        self.assertEqual(actual, str(Path("relative-bin/tool").resolve()))
+        self.assertTrue(Path(actual).is_absolute())
+
     def test_detached_windows_creation_flags_follow_job_breakaway_policy(self):
         base = (
             platform_support.DETACHED_PROCESS

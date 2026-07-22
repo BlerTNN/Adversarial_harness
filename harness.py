@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -25,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import review_protocol
 from platform_support import (
     WINDOWS,
     acquire_file_lock,
@@ -62,6 +65,8 @@ MAX_WINDOWS_BATCH_COMMAND_LINE = 8_000
 WINDOWS_BATCH_METACHARACTERS = "%!^&|<>()\r\n\""
 WINDOWS_RETRYABLE_REPLACE_ERRORS = {5, 32, 33}
 MAX_VERIFICATION_DETAILS = 8_000
+MAX_MANUAL_EVIDENCE_FILES = 100
+MAX_MANUAL_EVIDENCE_BYTES = 50 * 1024 * 1024
 PROTECTED_STATE_FIELDS = (
     "schema_version",
     "run_id",
@@ -314,13 +319,62 @@ def remove_owned_process_marker(path: Path, identity: tuple[int, str]) -> None:
         path.unlink(missing_ok=True)
 
 
-def read_handoff(path: Path) -> dict[str, Any]:
+def read_private_json(path: Path, *, maximum_bytes: int | None = None) -> dict[str, Any]:
     try:
-        if path.stat().st_size > MAX_HANDOFF_BYTES:
-            raise HarnessError(f"Structured handoff exceeds {MAX_HANDOFF_BYTES} bytes: {path}")
+        details = path.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_nlink != 1
+            or path.is_symlink()
+            or _is_reparse_point(path, details)
+        ):
+            raise HarnessError(f"Structured handoff must be a private regular file: {path}")
+        if maximum_bytes is not None and details.st_size > maximum_bytes:
+            raise HarnessError(f"Structured handoff exceeds {maximum_bytes} bytes: {path}")
     except OSError as error:
         raise HarnessError(f"Invalid JSON: {path}: {error}") from error
     return read_json(path)
+
+
+def read_handoff(path: Path) -> dict[str, Any]:
+    return read_private_json(path, maximum_bytes=MAX_HANDOFF_BYTES)
+
+
+def _has_real_parents(path: Path, root: Path) -> bool:
+    """Return whether every lexical parent from root to path is a real directory."""
+    path = Path(os.path.abspath(path))
+    root = Path(os.path.abspath(root))
+    if path != root and root not in path.parents:
+        return False
+    try:
+        root_details = root.lstat()
+        if (
+            not stat.S_ISDIR(root_details.st_mode)
+            or root.is_symlink()
+            or _is_junction(root, root_details)
+        ):
+            return False
+        current = root
+        for part in path.relative_to(root).parts[:-1]:
+            current /= part
+            details = current.lstat()
+            if (
+                not stat.S_ISDIR(details.st_mode)
+                or current.is_symlink()
+                or _is_junction(current, details)
+            ):
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def append_event(run_dir: Path, event: str, **details: Any) -> None:
@@ -427,6 +481,18 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     verification_timeout = config.get("verification_timeout_seconds", 600)
     if isinstance(verification_timeout, bool) or not isinstance(verification_timeout, int) or verification_timeout < 1:
         raise HarnessError("verification_timeout_seconds must be a positive integer")
+    review_protocol_version = config.get("review_protocol_version", 1)
+    if (
+        isinstance(review_protocol_version, bool)
+        or not isinstance(review_protocol_version, int)
+        or review_protocol_version not in {1, 2}
+    ):
+        raise HarnessError("review_protocol_version must be 1 or 2")
+    if review_protocol_version == 2:
+        try:
+            review_protocol.validate_review_policy(config.get("review_policy"))
+        except review_protocol.ReviewProtocolError as error:
+            raise HarnessError(f"Invalid review_policy: {error}") from error
     return config
 
 
@@ -493,6 +559,15 @@ def _windows_batch_argv_has_metacharacters(command: list[str]) -> bool:
         any(character in item for character in WINDOWS_BATCH_METACHARACTERS)
         for item in command
     )
+
+
+def _windows_command_line_error(command: list[str]) -> str:
+    if not WINDOWS:
+        return ""
+    windows_batch = Path(command[0]).suffix.casefold() in {".bat", ".cmd"}
+    limit = MAX_WINDOWS_BATCH_COMMAND_LINE if windows_batch else MAX_WINDOWS_COMMAND_LINE
+    units = len(format_command(command).encode("utf-16-le")) // 2
+    return "Command exceeds the safe Windows command-line limit" if units >= limit else ""
 
 
 def validate_agent_profile(profile_name: str, profile: dict[str, Any]) -> str:
@@ -610,6 +685,12 @@ def create_run(
         "verification_timeout_seconds": int(config.get("verification_timeout_seconds", 600)),
         "profiles": selected_profiles,
     }
+    review_protocol_version = int(config.get("review_protocol_version", 1))
+    run_config["review_protocol_version"] = review_protocol_version
+    if review_protocol_version == 2:
+        review_policy = config["review_policy"]
+        run_config["review_policy"] = review_policy
+        run_config["review_policy_sha256"] = review_protocol.review_policy_sha256(review_policy)
     state = {
         "schema_version": STATE_SCHEMA,
         "run_id": run_dir.name,
@@ -690,6 +771,7 @@ def _terminate(process: subprocess.Popen[str], grace: float = 5.0) -> None:
 
 
 def _isolated_process_environment(workspace: Path) -> dict[str, str]:
+    """Agent environment: preserve CLI authentication while isolating Git discovery."""
     environment = os.environ.copy()
     for name in (
         "GIT_DIR",
@@ -705,7 +787,46 @@ def _isolated_process_environment(workspace: Path) -> dict[str, str]:
     return environment
 
 
+def _review_command_environment(workspace: Path, scratch: Path) -> dict[str, str]:
+    """Minimal environment for repository-controlled verification commands."""
+    scratch.mkdir(parents=True, exist_ok=True)
+    temporary = scratch / "tmp"
+    home = scratch / "home"
+    temporary.mkdir()
+    home.mkdir()
+    allowed = {
+        "COMSPEC",
+        "LANG",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "WINDIR",
+    }
+    environment = {
+        name.upper(): value
+        for name, value in os.environ.items()
+        if name.upper() in allowed or name.upper().startswith("LC_")
+    }
+    environment.setdefault("PATH", os.defpath)
+    environment.update(
+        {
+            "GIT_CEILING_DIRECTORIES": str(workspace.resolve().parent),
+            "HOME": str(home),
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+            "TEMP": str(temporary),
+            "TMP": str(temporary),
+            "TMPDIR": str(temporary),
+            "USERPROFILE": str(home),
+        }
+    )
+    return environment
+
+
 def _control_guard(run_dir: Path, protected_files: tuple[Path, ...] = ()) -> dict[str, Any]:
+    if not _is_real_directory(run_dir):
+        raise HarnessError(f"Harness run directory must remain a real directory: {run_dir}")
     state = read_json(run_dir / "state.json")
     evidence = [run_dir / "base-artifact.json", run_dir / "request.md", run_dir / "harness.pid"]
     for pattern in (
@@ -714,12 +835,19 @@ def _control_guard(run_dir: Path, protected_files: tuple[Path, ...] = ()) -> dic
         "iterations/*/WORKER_RESULT.json",
         "iterations/*/VERIFICATION.json",
         "reviews/*/artifact.json",
+        "reviews/*/REVIEW_PLAN.json",
+        "reviews/*/REVIEW_CHECKS.json",
+        "reviews/*/harness-evidence/*/RESULT.json",
+        "reviews/*/MANUAL_EVIDENCE.json",
         "reviews/*/AUDIT.json",
+        "reviews/*/FINAL_REVIEW.json",
     ):
         evidence.extend(sorted(run_dir.glob(pattern)))
     protected = tuple(dict.fromkeys((*protected_files, *evidence)))
     protected_contents: dict[str, bytes] = {}
     for path in protected:
+        if not _has_real_parents(path, run_dir):
+            raise HarnessError(f"Protected Harness evidence has an unsafe parent directory: {path}")
         try:
             details = path.lstat()
             if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
@@ -727,16 +855,31 @@ def _control_guard(run_dir: Path, protected_files: tuple[Path, ...] = ()) -> dic
             protected_contents[str(path)] = path.read_bytes()
         except OSError as error:
             raise HarnessError(f"Protected Harness evidence is unavailable: {path}: {error}") from error
+    hashed_files: dict[str, tuple[int, str]] = {}
+    for path in sorted(run_dir.glob("reviews/*/harness-evidence/*/*.log")):
+        if not _has_real_parents(path, run_dir):
+            raise HarnessError(f"Protected Harness log has an unsafe parent directory: {path}")
+        try:
+            details = path.lstat()
+            if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+                raise HarnessError(f"Protected Harness log is not a private regular file: {path}")
+            hashed_files[str(path)] = (details.st_size, _file_sha256(path))
+        except OSError as error:
+            raise HarnessError(f"Protected Harness log is unavailable: {path}: {error}") from error
     return {
         "config": read_json(run_dir / "run-config.json"),
         "state_document": state,
         "state": {field: state.get(field) for field in PROTECTED_STATE_FIELDS},
         "active_agent": state.get("active_agent"),
         "files": protected_contents,
+        "hashed_files": hashed_files,
+        "harness_evidence_inventories": _harness_evidence_inventories(run_dir),
     }
 
 
 def _verify_control_guard(run_dir: Path, guard: dict[str, Any]) -> None:
+    if not _is_real_directory(run_dir):
+        raise HarnessError("Agent modified protected Harness control data: run directory")
     changed: list[str] = []
     config_path = run_dir / "run-config.json"
     try:
@@ -772,6 +915,9 @@ def _verify_control_guard(run_dir: Path, guard: dict[str, Any]) -> None:
 
     for raw_path, expected in guard["files"].items():
         path = Path(raw_path)
+        if not _has_real_parents(path, run_dir):
+            changed.append(_run_relative(path, run_dir))
+            continue
         try:
             details = path.lstat()
             actual = (
@@ -784,6 +930,28 @@ def _verify_control_guard(run_dir: Path, guard: dict[str, Any]) -> None:
         if actual != expected:
             atomic_write_bytes(path, expected)
             changed.append(_run_relative(path, run_dir))
+    for raw_path, expected in guard.get("hashed_files", {}).items():
+        path = Path(raw_path)
+        if not _has_real_parents(path, run_dir):
+            changed.append(_run_relative(path, run_dir))
+            continue
+        try:
+            details = path.lstat()
+            actual = (
+                (details.st_size, _file_sha256(path))
+                if stat.S_ISREG(details.st_mode) and details.st_nlink == 1
+                else None
+            )
+        except OSError:
+            actual = None
+        if actual != expected:
+            changed.append(_run_relative(path, run_dir))
+    try:
+        inventories = _harness_evidence_inventories(run_dir)
+    except HarnessError:
+        inventories = None
+    if inventories != guard.get("harness_evidence_inventories", {}):
+        changed.append("reviews/*/harness-evidence inventory")
     if changed:
         raise HarnessError("Agent modified protected Harness control data: " + ", ".join(changed))
 
@@ -823,12 +991,7 @@ def run_agent(
     except (KeyError, ValueError) as error:
         raise HarnessError(f"Invalid agent command template for {profile_name}: {error}") from error
     command[0] = validate_agent_profile(profile_name, profile)
-    windows_batch = WINDOWS and Path(command[0]).suffix.casefold() in {".bat", ".cmd"}
-    windows_command_units = (
-        len(format_command(command).encode("utf-16-le")) // 2 if WINDOWS else 0
-    )
-    windows_limit = MAX_WINDOWS_BATCH_COMMAND_LINE if windows_batch else MAX_WINDOWS_COMMAND_LINE
-    if WINDOWS and windows_command_units >= windows_limit:
+    if _windows_command_line_error(command):
         raise HarnessError(
             f"Command exceeds the safe Windows command-line limit; use stdin or {{prompt_file}} for {profile_name}"
         )
@@ -978,7 +1141,7 @@ def _worker_result(run_dir: Path, index: int) -> tuple[Path, dict[str, Any]]:
 def _archive_worker_result(run_dir: Path, index: int) -> Path:
     """Archive the worker's fixed handoff path for this review round."""
     current = run_dir / "WORKER_RESULT.json"
-    result = read_json(current)
+    result = read_handoff(current)
     archived = run_dir / "iterations" / f"{index:02d}" / "WORKER_RESULT.json"
     write_json(archived, result)
     current.unlink(missing_ok=True)
@@ -987,7 +1150,7 @@ def _archive_worker_result(run_dir: Path, index: int) -> Path:
 
 def _quarantine(path: Path) -> None:
     """Keep an invalid handoff for diagnosis while allowing `continue` to retry."""
-    if not path.exists():
+    if not os.path.lexists(path):
         return
     candidate = path.with_name(f"{path.stem}.invalid-{uuid.uuid4().hex[:6]}{path.suffix}")
     path.replace(candidate)
@@ -1307,6 +1470,10 @@ def _run_verification(run_dir: Path, index: int, workspace: Path, config: dict[s
         _copy_workspace(trusted_workspace, verification_workspace)
         if _workspace_manifest(verification_workspace)["sha256"] != artifact["sha256"]:
             raise HarnessError("Candidate changed while the deterministic verification snapshot was being created")
+        verification_environment = _review_command_environment(
+            verification_workspace,
+            Path(temporary) / "runtime",
+        )
         for number, raw_command in enumerate(commands, start=1):
             command = list(raw_command)
             command_text = format_command(command)
@@ -1336,25 +1503,31 @@ def _run_verification(run_dir: Path, index: int, workspace: Path, config: dict[s
                         )
                         log.write(error_text + "\n")
                     else:
-                        try:
-                            process = spawn_managed_process(
-                                launch_command,
-                                cwd=verification_workspace,
-                                env=_isolated_process_environment(verification_workspace),
-                                stdin=subprocess.DEVNULL,
-                                stdout=log,
-                                stderr=subprocess.STDOUT,
-                                text=True,
-                                encoding="utf-8",
-                            )
-                        except OSError as error:
+                        windows_error = _windows_command_line_error(launch_command)
+                        if windows_error:
                             process = None
-                            error_text = str(error)
+                            error_text = windows_error
                             log.write(error_text + "\n")
-                        except RuntimeError as error:
-                            raise HarnessError(
-                                f"Could not launch deterministic verification safely: {error}"
-                            ) from error
+                        else:
+                            try:
+                                process = spawn_managed_process(
+                                    launch_command,
+                                    cwd=verification_workspace,
+                                    env=verification_environment,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=log,
+                                    stderr=subprocess.STDOUT,
+                                    text=True,
+                                    encoding="utf-8",
+                                )
+                            except OSError as error:
+                                process = None
+                                error_text = str(error)
+                                log.write(error_text + "\n")
+                            except RuntimeError as error:
+                                raise HarnessError(
+                                    f"Could not launch deterministic verification safely: {error}"
+                                ) from error
                 if process is not None:
                     active_verifier: dict[str, Any] | None = None
                     try:
@@ -1445,20 +1618,47 @@ def _read_verification(
     expected_commands: list[list[str]] | None = None,
 ) -> dict[str, Any]:
     path = _verification_path(run_dir, index)
-    report = read_json(path)
+    report = read_private_json(path)
     if report.get("schema_version") != VERIFICATION_SCHEMA or report.get("artifact_id") != artifact_id:
         raise HarnessError(f"Deterministic verification does not match the reviewed artifact: {path}")
     if report.get("status") not in {"pass", "fail"} or not isinstance(report.get("commands"), list):
         raise HarnessError(f"Invalid deterministic verification report: {path}")
     commands = report["commands"]
-    if not commands or any(
-        not isinstance(item, dict)
-        or item.get("status") not in {"pass", "fail"}
-        or not isinstance(item.get("argv"), list)
-        or not all(isinstance(argument, str) and argument for argument in item["argv"])
-        for item in commands
-    ):
+    if not commands:
         raise HarnessError(f"Invalid deterministic verification command result: {path}")
+    for item in commands:
+        if (
+            not isinstance(item, dict)
+            or item.get("status") not in {"pass", "fail"}
+            or not isinstance(item.get("argv"), list)
+            or not item["argv"]
+            or not all(isinstance(argument, str) and argument for argument in item["argv"])
+            or not all(isinstance(item.get(field), str) for field in ("name", "command", "details", "log"))
+            or item.get("command") != format_command(item["argv"])
+            or not isinstance(item.get("timed_out"), bool)
+            or (
+                item.get("returncode") is not None
+                and (
+                    isinstance(item.get("returncode"), bool)
+                    or not isinstance(item.get("returncode"), int)
+                )
+            )
+            or isinstance(item.get("duration_seconds"), bool)
+            or not isinstance(item.get("duration_seconds"), (int, float))
+            or (
+                isinstance(item.get("duration_seconds"), float)
+                and not math.isfinite(item["duration_seconds"])
+            )
+            or item["duration_seconds"] < 0
+        ):
+            raise HarnessError(f"Invalid deterministic verification command result: {path}")
+        expected_status = (
+            "pass"
+            if item["returncode"] == 0 and not item["timed_out"]
+            else "fail"
+        )
+        if item["status"] != expected_status:
+            raise HarnessError(f"Inconsistent deterministic verification command result: {path}")
     calculated = "pass" if all(item["status"] == "pass" for item in commands) else "fail"
     if report["status"] != calculated:
         raise HarnessError(f"Inconsistent deterministic verification result: {path}")
@@ -1493,6 +1693,1228 @@ def _apply_verification_gate(audit: dict[str, Any], verification: dict[str, Any]
             "acceptance_test": "Run the same configured verification commands and require exit status 0 for each.",
         }
     )
+
+
+def _review_dir(run_dir: Path, index: int) -> Path:
+    return run_dir / "reviews" / f"{index:02d}"
+
+
+def _review_plan_path(run_dir: Path, index: int) -> Path:
+    return _review_dir(run_dir, index) / "REVIEW_PLAN.json"
+
+
+def _review_checks_path(run_dir: Path, index: int) -> Path:
+    return _review_dir(run_dir, index) / "REVIEW_CHECKS.json"
+
+
+def _final_review_path(run_dir: Path, index: int) -> Path:
+    return _review_dir(run_dir, index) / "FINAL_REVIEW.json"
+
+
+def _review_protocol_version(config: dict[str, Any]) -> int:
+    value = config.get("review_protocol_version", 1)
+    if isinstance(value, bool) or not isinstance(value, int) or value not in {1, 2}:
+        raise HarnessError("Run has an invalid review_protocol_version")
+    return value
+
+
+def _review_policy(config: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    try:
+        policy = review_protocol.validate_review_policy(config.get("review_policy"))
+        digest = review_protocol.review_policy_sha256(policy)
+    except review_protocol.ReviewProtocolError as error:
+        raise HarnessError(f"Run has an invalid Review v2 policy: {error}") from error
+    if config.get("review_policy_sha256") != digest:
+        raise HarnessError("Run Review v2 policy fingerprint does not match its snapshotted policy")
+    return policy, digest
+
+
+def _derived_worker_claims(worker_result: dict[str, Any]) -> list[dict[str, str]]:
+    claims = [
+        {
+            "id": "CLAIM-SUMMARY",
+            "statement": str(worker_result["summary"]),
+        }
+    ]
+    for index, check in enumerate(worker_result["checks"], start=1):
+        claims.append(
+            {
+                "id": f"CLAIM-CHECK-{index:03d}",
+                "statement": (
+                    f"{check['name']} [{str(check['status']).lower()}]: "
+                    f"{check['details']}"
+                ),
+            }
+        )
+    return claims
+
+
+def _read_review_plan_v2(
+    run_dir: Path,
+    index: int,
+    *,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    artifact_id: str,
+    worker_result: dict[str, Any],
+) -> dict[str, Any]:
+    path = _review_plan_path(run_dir, index)
+    plan = read_handoff(path)
+    policy, policy_digest = _review_policy(config)
+    try:
+        plan = review_protocol.validate_review_plan(
+            plan,
+            artifact_id=artifact_id,
+            round_index=index,
+            policy=policy,
+            policy_sha256=policy_digest,
+            authoritative_request=str(state["request"]),
+            worker_claims=_derived_worker_claims(worker_result),
+        )
+    except review_protocol.ReviewProtocolError as error:
+        raise HarnessError(f"Invalid structured review plan: {path}: {error}") from error
+    changed = False
+    for check in plan["checks"]:
+        if check["kind"] != "command":
+            continue
+        for step in check["steps"]:
+            for argument_index, argument in enumerate(step):
+                if argument == "{python}":
+                    step[argument_index] = sys.executable
+                    changed = True
+    if changed:
+        write_json(path, plan)
+    return plan
+
+
+def _empty_log(path: Path) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    set_private_permissions(path)
+    return hashlib.sha256(b"").hexdigest()
+
+
+def _capture_bounded_pipe(
+    stream: Any,
+    path: Path,
+    limit: int,
+    result: dict[str, Any],
+) -> None:
+    digest = hashlib.sha256()
+    written = 0
+    truncated = False
+    try:
+        with path.open("wb") as output:
+            set_private_permissions(path)
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    break
+                remaining = max(0, limit - written)
+                recorded = chunk[:remaining]
+                if recorded:
+                    output.write(recorded)
+                    digest.update(recorded)
+                    written += len(recorded)
+                if len(recorded) != len(chunk):
+                    truncated = True
+        result.update({"sha256": digest.hexdigest(), "truncated": truncated})
+    except BaseException as error:
+        result["error"] = error
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _review_check_log_path(review_dir: Path, check_id: str, step: int, stream: str) -> Path:
+    return review_dir / "harness-evidence" / check_id / f"step-{step:02d}.{stream}.log"
+
+
+def _review_check_step(
+    *,
+    run_dir: Path,
+    review_dir: Path,
+    check: dict[str, Any],
+    step_index: int,
+    workspace: Path,
+    environment: dict[str, str],
+    deadline: float,
+    log_limit: int,
+) -> dict[str, Any]:
+    argv = list(check["steps"][step_index])
+    launch = list(argv)
+    stdout_path = _review_check_log_path(review_dir, check["id"], step_index + 1, "stdout")
+    stderr_path = _review_check_log_path(review_dir, check["id"], step_index + 1, "stderr")
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    process: subprocess.Popen[Any] | None = None
+    returncode: int | None = None
+    timed_out = False
+    error_text = ""
+    stdout_result: dict[str, Any] = {}
+    stderr_result: dict[str, Any] = {}
+
+    executable = resolve_program(launch[0], cwd=workspace)
+    if executable is None:
+        error_text = f"Review check executable is unavailable: {launch[0]}"
+    else:
+        launch[0] = executable
+        if _windows_batch_argv_has_metacharacters(launch):
+            error_text = (
+                "Windows batch review-check argv contains cmd.exe metacharacters; "
+                "use a native executable or remove the metacharacters"
+            )
+        else:
+            error_text = _windows_command_line_error(launch)
+    if error_text:
+        stdout_sha = _empty_log(stdout_path)
+        stderr_sha = _empty_log(stderr_path)
+        return {
+            "argv": argv,
+            "returncode": None,
+            "timed_out": False,
+            "stdout_path": _run_relative(stdout_path, review_dir),
+            "stderr_path": _run_relative(stderr_path, review_dir),
+            "stdout_sha256": stdout_sha,
+            "stderr_sha256": stderr_sha,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "error": error_text,
+        }
+
+    try:
+        process = spawn_managed_process(
+            launch,
+            cwd=workspace,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, RuntimeError) as error:
+        error_text = str(error)
+        stdout_sha = _empty_log(stdout_path)
+        stderr_sha = _empty_log(stderr_path)
+        return {
+            "argv": argv,
+            "returncode": None,
+            "timed_out": False,
+            "stdout_path": _run_relative(stdout_path, review_dir),
+            "stderr_path": _run_relative(stderr_path, review_dir),
+            "stdout_sha256": stdout_sha,
+            "stderr_sha256": stderr_sha,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "error": error_text,
+        }
+
+    process_started = managed_process_start_time(process)
+    if not process_started:
+        try:
+            _terminate(process)
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        raise HarnessError("Could not establish a safe process identity for a planned review check")
+
+    threads = [
+        threading.Thread(
+            target=_capture_bounded_pipe,
+            args=(process.stdout, stdout_path, log_limit, stdout_result),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_capture_bounded_pipe,
+            args=(process.stderr, stderr_path, log_limit, stderr_result),
+            daemon=True,
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    active = {
+        "profile": "harness",
+        "role": "REVIEW_CHECK",
+        "pid": process.pid,
+        "process_group": process.pid,
+        "pid_started": process_started,
+        "log": _run_relative(stdout_path, run_dir),
+        "started_at": now(),
+    }
+    paused = False
+    try:
+        _update_state(run_dir, active_agent=active)
+        append_event(
+            run_dir,
+            "review_check_started",
+            check_id=check["id"],
+            step=step_index + 1,
+            pid=process.pid,
+        )
+        while process.poll() is None:
+            if pause_requested(run_dir):
+                paused = True
+                _terminate(process)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _terminate(process)
+                break
+            try:
+                process.wait(timeout=max(0.01, min(0.1, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                pass
+        returncode = process.wait()
+        _terminate(process, grace=1.0)
+        _update_state(run_dir, active_agent=None)
+    except BaseException:
+        try:
+            _terminate(process)
+        except BaseException:
+            try:
+                _update_state(run_dir, active_agent=active)
+            except (OSError, HarnessError):
+                pass
+            raise
+        try:
+            _update_state(run_dir, active_agent=None)
+        except (OSError, HarnessError):
+            pass
+        raise
+    finally:
+        for thread in threads:
+            thread.join(timeout=5)
+    if any(thread.is_alive() for thread in threads):
+        raise HarnessError("Could not finish capturing planned review-check output")
+    for result in (stdout_result, stderr_result):
+        if "error" in result:
+            raise HarnessError(f"Could not record planned review-check output: {result['error']}")
+    append_event(
+        run_dir,
+        "review_check_finished",
+        check_id=check["id"],
+        step=step_index + 1,
+        returncode=returncode,
+        timed_out=timed_out,
+    )
+    if paused:
+        raise OperatorPause("A planned review check was stopped at the user's request.")
+    return {
+        "argv": argv,
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "stdout_path": _run_relative(stdout_path, review_dir),
+        "stderr_path": _run_relative(stderr_path, review_dir),
+        "stdout_sha256": stdout_result["sha256"],
+        "stderr_sha256": stderr_result["sha256"],
+        "stdout_truncated": stdout_result["truncated"],
+        "stderr_truncated": stderr_result["truncated"],
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "error": error_text,
+    }
+
+
+def _run_planned_review_checks(
+    run_dir: Path,
+    index: int,
+    workspace: Path,
+    artifact: dict[str, Any],
+    plan: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    review_dir = _review_dir(run_dir, index)
+    evidence_root = review_dir / "harness-evidence"
+    _quarantine(evidence_root)
+    checks_path = _review_checks_path(run_dir, index)
+    _quarantine(checks_path)
+    policy, policy_digest = _review_policy(config)
+    plan_digest = review_protocol.plan_sha256(plan)
+    total_deadline = time.monotonic() + policy["total_check_timeout_seconds"]
+    results: list[dict[str, Any]] = []
+    command_checks = [check for check in plan["checks"] if check["kind"] == "command"]
+    with _guard_candidate_workspace(workspace, artifact, "Review check runner") as trusted_workspace:
+        for check in command_checks:
+            _assert_live_workspace_unchanged(run_dir)
+            check_started = time.monotonic()
+            started_at = now()
+            steps: list[dict[str, Any]] = []
+            status = "pass"
+            details = "All planned steps met their expected exit codes."
+            if time.monotonic() >= total_deadline:
+                status = "not_run"
+                details = "The total planned review-check budget was exhausted before this check started."
+            else:
+                with tempfile.TemporaryDirectory(prefix="harness-review-check-") as temporary:
+                    check_root = Path(temporary)
+                    check_workspace = check_root / "workspace"
+                    _copy_workspace(trusted_workspace, check_workspace)
+                    if _workspace_manifest(check_workspace)["sha256"] != artifact["sha256"]:
+                        raise HarnessError("Candidate changed while a planned review-check snapshot was being created")
+                    environment = _review_command_environment(check_workspace, check_root / "runtime")
+                    check_deadline = min(
+                        total_deadline,
+                        time.monotonic() + int(check["timeout_seconds"]),
+                    )
+                    allowed = set(check["expected"]["exit_codes"])
+                    for step_index in range(len(check["steps"])):
+                        step = _review_check_step(
+                            run_dir=run_dir,
+                            review_dir=review_dir,
+                            check=check,
+                            step_index=step_index,
+                            workspace=check_workspace,
+                            environment=environment,
+                            deadline=check_deadline,
+                            log_limit=policy["max_log_bytes_per_step"],
+                        )
+                        steps.append(step)
+                        if step["error"]:
+                            status = "error"
+                            details = step["error"]
+                            break
+                        if step["timed_out"]:
+                            status = "fail"
+                            details = "A planned review-check step exceeded its timeout."
+                            break
+                        if step["returncode"] not in allowed:
+                            status = "fail"
+                            details = f"A planned review-check step exited with status {step['returncode']}."
+                            break
+            finished_at = now()
+            result = {
+                "schema_version": review_protocol.CHECK_RESULT_SCHEMA,
+                "artifact_id": artifact["sha256"],
+                "policy_sha256": policy_digest,
+                "plan_sha256": plan_digest,
+                "check_id": check["id"],
+                "status": status,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_seconds": round(time.monotonic() - check_started, 3),
+                "steps": steps,
+                "details": details,
+            }
+            result_path = evidence_root / check["id"] / "RESULT.json"
+            write_json(result_path, result)
+            results.append(result)
+            _assert_live_workspace_unchanged(run_dir)
+    bundle = {
+        "schema_version": review_protocol.CHECKS_SCHEMA,
+        "artifact_id": artifact["sha256"],
+        "policy_sha256": policy_digest,
+        "plan_sha256": plan_digest,
+        "round": index,
+        "results": results,
+    }
+    write_json(checks_path, bundle)
+    return _read_review_checks_v2(
+        run_dir,
+        index,
+        plan=plan,
+        artifact_id=str(artifact["sha256"]),
+        config=config,
+    )
+
+
+def _review_evidence_path(review_dir: Path, relative: str, *, prefix: str) -> Path:
+    try:
+        root_details = review_dir.lstat()
+    except OSError as error:
+        raise HarnessError(f"Review evidence directory is unavailable: {review_dir}: {error}") from error
+    if (
+        not stat.S_ISDIR(root_details.st_mode)
+        or review_dir.is_symlink()
+        or _is_junction(review_dir, root_details)
+    ):
+        raise HarnessError(f"Review evidence directory must be a real directory: {review_dir}")
+    candidate = Path(relative)
+    if (
+        candidate.anchor
+        or candidate == Path(".")
+        or ".." in candidate.parts
+        or any(":" in part for part in candidate.parts)
+    ):
+        raise HarnessError(f"Unsafe review evidence path: {relative}")
+    normalized = candidate.as_posix()
+    if not normalized.startswith(prefix + "/"):
+        raise HarnessError(f"Review evidence must be stored under {prefix}/: {relative}")
+    path = Path(os.path.abspath(review_dir / candidate))
+    lexical_root = Path(os.path.abspath(review_dir))
+    if lexical_root not in path.parents:
+        raise HarnessError(f"Review evidence escapes its authorized directory: {relative}")
+    parent = lexical_root
+    for part in candidate.parts[:-1]:
+        parent /= part
+        try:
+            details = parent.lstat()
+        except OSError as error:
+            raise HarnessError(f"Review evidence parent is unavailable: {relative}: {error}") from error
+        if not stat.S_ISDIR(details.st_mode) or parent.is_symlink() or _is_junction(parent, details):
+            raise HarnessError(f"Review evidence parent must be a real directory: {relative}")
+    return path
+
+
+def _verified_evidence_file(
+    review_dir: Path,
+    relative: str,
+    *,
+    prefix: str,
+    expected_sha256: str | None = None,
+    maximum_bytes: int,
+) -> tuple[Path, os.stat_result, str]:
+    path = _review_evidence_path(review_dir, relative, prefix=prefix)
+    try:
+        details = path.lstat()
+    except OSError as error:
+        raise HarnessError(f"Review evidence is unavailable: {relative}: {error}") from error
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_nlink != 1
+        or path.is_symlink()
+        or _is_reparse_point(path, details)
+    ):
+        raise HarnessError(f"Review evidence must be a private regular file: {relative}")
+    if details.st_size > maximum_bytes:
+        raise HarnessError(f"Review evidence exceeds its size limit: {relative}")
+    digest = _file_sha256(path)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise HarnessError(f"Review evidence hash does not match its Harness result: {relative}")
+    return path, details, digest
+
+
+def _review_evidence_inventory(review_dir: Path, prefix: str) -> set[str]:
+    root = review_dir / prefix
+    if not os.path.lexists(root):
+        return set()
+    try:
+        root_details = root.lstat()
+    except OSError as error:
+        raise HarnessError(f"Review evidence directory is unavailable: {root}: {error}") from error
+    if (
+        not stat.S_ISDIR(root_details.st_mode)
+        or root.is_symlink()
+        or _is_junction(root, root_details)
+    ):
+        raise HarnessError(f"Review evidence directory must be a real directory: {root}")
+    files: set[str] = set()
+    try:
+        for current_raw, directories, names in os.walk(root, followlinks=False):
+            current = Path(current_raw)
+            for name in directories:
+                path = current / name
+                details = path.lstat()
+                if (
+                    not stat.S_ISDIR(details.st_mode)
+                    or path.is_symlink()
+                    or _is_junction(path, details)
+                ):
+                    raise HarnessError(f"Review evidence contains an unsafe directory: {path}")
+            for name in names:
+                path = current / name
+                details = path.lstat()
+                if (
+                    not stat.S_ISREG(details.st_mode)
+                    or details.st_nlink != 1
+                    or path.is_symlink()
+                    or _is_reparse_point(path, details)
+                ):
+                    raise HarnessError(f"Review evidence must be a private regular file: {path}")
+                files.add(path.relative_to(review_dir).as_posix())
+    except OSError as error:
+        raise HarnessError(f"Could not inventory Harness review evidence: {root}: {error}") from error
+    return files
+
+
+def _harness_evidence_inventories(run_dir: Path) -> dict[str, set[str]]:
+    reviews_root = run_dir / "reviews"
+    if not os.path.lexists(reviews_root):
+        return {}
+    try:
+        reviews_details = reviews_root.lstat()
+        if (
+            not stat.S_ISDIR(reviews_details.st_mode)
+            or reviews_root.is_symlink()
+            or _is_junction(reviews_root, reviews_details)
+        ):
+            raise HarnessError(f"Review records directory must be a real directory: {reviews_root}")
+        inventories = {}
+        for review_dir in reviews_root.iterdir():
+            review_details = review_dir.lstat()
+            if (
+                not stat.S_ISDIR(review_details.st_mode)
+                or review_dir.is_symlink()
+                or _is_junction(review_dir, review_details)
+            ):
+                raise HarnessError(f"Review record must be a real directory: {review_dir}")
+            evidence_root = review_dir / "harness-evidence"
+            if os.path.lexists(evidence_root):
+                inventories[_run_relative(evidence_root, run_dir)] = _review_evidence_inventory(
+                    review_dir,
+                    "harness-evidence",
+                )
+    except OSError as error:
+        raise HarnessError(f"Could not inventory Harness review records: {error}") from error
+    return inventories
+
+
+def _read_review_checks_v2(
+    run_dir: Path,
+    index: int,
+    *,
+    plan: dict[str, Any],
+    artifact_id: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    path = _review_checks_path(run_dir, index)
+    bundle = read_handoff(path)
+    policy, policy_digest = _review_policy(config)
+    try:
+        bundle = review_protocol.validate_review_checks(
+            bundle,
+            plan=plan,
+            artifact_id=artifact_id,
+            policy_sha256=policy_digest,
+        )
+    except review_protocol.ReviewProtocolError as error:
+        raise HarnessError(f"Invalid Harness-owned review-check evidence: {path}: {error}") from error
+    review_dir = _review_dir(run_dir, index)
+    expected_files: set[str] = set()
+    for result in bundle["results"]:
+        result_relative = f"harness-evidence/{result['check_id']}/RESULT.json"
+        expected_files.add(result_relative)
+        result_path, _details, _digest = _verified_evidence_file(
+            review_dir,
+            result_relative,
+            prefix="harness-evidence",
+            maximum_bytes=MAX_HANDOFF_BYTES,
+        )
+        if read_handoff(result_path) != result:
+            raise HarnessError(f"Review check result does not match its aggregate record: {result_path}")
+        for step in result["steps"]:
+            expected_files.update((step["stdout_path"], step["stderr_path"]))
+            _verified_evidence_file(
+                review_dir,
+                step["stdout_path"],
+                prefix="harness-evidence",
+                expected_sha256=step["stdout_sha256"],
+                maximum_bytes=policy["max_log_bytes_per_step"],
+            )
+            _verified_evidence_file(
+                review_dir,
+                step["stderr_path"],
+                prefix="harness-evidence",
+                expected_sha256=step["stderr_sha256"],
+                maximum_bytes=policy["max_log_bytes_per_step"],
+            )
+    if _review_evidence_inventory(review_dir, "harness-evidence") != expected_files:
+        raise HarnessError("Harness review evidence contains missing or unexpected files")
+    return bundle
+
+
+def _run_review_agent_stage(
+    *,
+    run_dir: Path,
+    candidate_workspace: Path,
+    artifact: dict[str, Any],
+    reviewer_name: str,
+    config: dict[str, Any],
+    timeout: int,
+    prompt_name: str,
+    prompt_values: dict[str, str],
+    prompt_path: Path,
+    log_path: Path,
+    protected_files: tuple[Path, ...],
+    actor: str,
+) -> None:
+    if not _is_real_directory(candidate_workspace):
+        raise HarnessError("The isolated candidate workspace is unavailable")
+    _assert_live_workspace_unchanged(run_dir)
+    with tempfile.TemporaryDirectory(prefix="harness-review-guard-") as guard_temporary:
+        trusted_candidate = Path(guard_temporary) / "candidate"
+        _copy_workspace(candidate_workspace, trusted_candidate)
+        if _workspace_manifest(trusted_candidate)["sha256"] != artifact["sha256"]:
+            raise HarnessError(f"Candidate changed while the trusted {actor.lower()} snapshot was being created")
+        with tempfile.TemporaryDirectory(prefix="harness-review-") as temporary:
+            review_workspace = Path(temporary) / "workspace"
+            _copy_workspace(trusted_candidate, review_workspace)
+            if _workspace_manifest(review_workspace)["sha256"] != artifact["sha256"]:
+                raise HarnessError(f"Candidate changed while the {actor.lower()} snapshot was being created")
+            prompt = render_prompt(
+                prompt_name,
+                workspace=str(review_workspace),
+                **prompt_values,
+            )
+            guard = _control_guard(run_dir, protected_files)
+            try:
+                run_agent(
+                    run_dir=run_dir,
+                    profile_name=reviewer_name,
+                    profile=config["profiles"][reviewer_name],
+                    role="TASK_REVIEWER",
+                    prompt=prompt,
+                    prompt_path=prompt_path,
+                    log_path=log_path,
+                    timeout_seconds=timeout,
+                    workspace=review_workspace,
+                    guard=guard,
+                )
+            finally:
+                agent_error = sys.exc_info()[1]
+                postcondition_errors: list[str] = []
+                try:
+                    _verify_control_guard(run_dir, guard)
+                except HarnessError as error:
+                    postcondition_errors.append(str(error))
+                try:
+                    _restore_workspace_if_changed(
+                        candidate_workspace,
+                        trusted_candidate,
+                        artifact,
+                        actor,
+                    )
+                except HarnessError as error:
+                    postcondition_errors.append(str(error))
+                try:
+                    _assert_live_workspace_unchanged(run_dir)
+                except HarnessError as error:
+                    postcondition_errors.append(str(error))
+                if postcondition_errors:
+                    details = "; ".join(postcondition_errors)
+                    if agent_error is not None:
+                        details = f"{agent_error}; {details}"
+                    raise HarnessError(details) from agent_error
+
+
+def _read_audit_v2(
+    run_dir: Path,
+    index: int,
+    *,
+    plan: dict[str, Any],
+    checks: dict[str, Any],
+) -> dict[str, Any]:
+    path = _review_dir(run_dir, index) / "AUDIT.json"
+    audit = read_handoff(path)
+    try:
+        return review_protocol.validate_audit_v2(audit, plan=plan, checks=checks)
+    except review_protocol.ReviewProtocolError as error:
+        raise HarnessError(f"Invalid Review v2 audit: {path}: {error}") from error
+
+
+def _record_manual_evidence(
+    run_dir: Path,
+    index: int,
+    *,
+    plan: dict[str, Any],
+    audit: dict[str, Any],
+) -> dict[str, Any]:
+    review_dir = _review_dir(run_dir, index)
+    planned_check_ids = {check["id"] for check in plan["checks"]}
+    references = {
+        reference
+        for check in audit["checks"]
+        for reference in check["evidence_refs"]
+    }
+    references.update(
+        reference
+        for issue in audit["issues"]
+        for reference in issue["evidence_refs"]
+        if reference not in planned_check_ids
+    )
+    if len(references) > MAX_MANUAL_EVIDENCE_FILES:
+        raise HarnessError("Reviewer cited too many persistent evidence files")
+    files: list[dict[str, Any]] = []
+    total = 0
+    for reference in sorted(references):
+        _path, details, digest = _verified_evidence_file(
+            review_dir,
+            reference,
+            prefix="reviewer-evidence",
+            maximum_bytes=MAX_MANUAL_EVIDENCE_BYTES,
+        )
+        total += details.st_size
+        if total > MAX_MANUAL_EVIDENCE_BYTES:
+            raise HarnessError("Reviewer evidence exceeds the total size limit")
+        files.append({"path": Path(reference).as_posix(), "size": details.st_size, "sha256": digest})
+    manifest = {
+        "schema_version": "generic-harness/manual-evidence/v1",
+        "artifact_id": plan["artifact_id"],
+        "plan_sha256": review_protocol.plan_sha256(plan),
+        "files": files,
+    }
+    write_json(review_dir / "MANUAL_EVIDENCE.json", manifest)
+    return manifest
+
+
+def _read_manual_evidence(
+    run_dir: Path,
+    index: int,
+    *,
+    plan: dict[str, Any],
+    audit: dict[str, Any],
+) -> dict[str, Any]:
+    review_dir = _review_dir(run_dir, index)
+    path = review_dir / "MANUAL_EVIDENCE.json"
+    manifest = read_handoff(path)
+    expected_keys = {"schema_version", "artifact_id", "plan_sha256", "files"}
+    if set(manifest) != expected_keys:
+        raise HarnessError(f"Invalid manual evidence manifest fields: {path}")
+    if (
+        manifest["schema_version"] != "generic-harness/manual-evidence/v1"
+        or manifest["artifact_id"] != plan["artifact_id"]
+        or manifest["plan_sha256"] != review_protocol.plan_sha256(plan)
+        or not isinstance(manifest["files"], list)
+    ):
+        raise HarnessError(f"Manual evidence manifest identity is invalid: {path}")
+    planned_check_ids = {check["id"] for check in plan["checks"]}
+    required = {
+        reference
+        for check in audit["checks"]
+        for reference in check["evidence_refs"]
+    }
+    required.update(
+        reference
+        for issue in audit["issues"]
+        for reference in issue["evidence_refs"]
+        if reference not in planned_check_ids
+    )
+    recorded: set[str] = set()
+    total = 0
+    for item in manifest["files"]:
+        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+            raise HarnessError(f"Invalid manual evidence entry: {path}")
+        relative = item["path"]
+        if not isinstance(relative, str) or relative in recorded:
+            raise HarnessError(f"Duplicate or invalid manual evidence path: {path}")
+        _evidence_path, details, digest = _verified_evidence_file(
+            review_dir,
+            relative,
+            prefix="reviewer-evidence",
+            expected_sha256=str(item["sha256"]),
+            maximum_bytes=MAX_MANUAL_EVIDENCE_BYTES,
+        )
+        if item["size"] != details.st_size or digest != item["sha256"]:
+            raise HarnessError(f"Manual evidence no longer matches its manifest: {relative}")
+        total += details.st_size
+        recorded.add(relative)
+    if recorded != required or total > MAX_MANUAL_EVIDENCE_BYTES:
+        raise HarnessError("Manual evidence manifest does not match the audit references")
+    return manifest
+
+
+def _adjudicate_review_v2(
+    run_dir: Path,
+    index: int,
+    *,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    artifact: dict[str, Any],
+    worker_result: dict[str, Any],
+    write_result: bool,
+) -> dict[str, Any]:
+    artifact_id = str(artifact["sha256"])
+    plan = _read_review_plan_v2(
+        run_dir,
+        index,
+        state=state,
+        config=config,
+        artifact_id=artifact_id,
+        worker_result=worker_result,
+    )
+    checks = _read_review_checks_v2(
+        run_dir,
+        index,
+        plan=plan,
+        artifact_id=artifact_id,
+        config=config,
+    )
+    audit = _read_audit_v2(run_dir, index, plan=plan, checks=checks)
+    manual = _read_manual_evidence(run_dir, index, plan=plan, audit=audit)
+    verification = _read_verification(
+        run_dir,
+        index,
+        artifact_id,
+        config["verification_commands"],
+    )
+    policy, policy_digest = _review_policy(config)
+    verdict, reason_codes = review_protocol.adjudicate_review(
+        plan=plan,
+        checks=checks,
+        audit=audit,
+        deterministic_verification_passed=verification["status"] == "pass",
+        policy=policy,
+    )
+    review_dir = _review_dir(run_dir, index)
+    evidence_paths = {
+        _run_relative(review_dir / "artifact.json", run_dir),
+        _run_relative(_verification_path(run_dir, index), run_dir),
+        _run_relative(_review_plan_path(run_dir, index), run_dir),
+        _run_relative(_review_checks_path(run_dir, index), run_dir),
+        _run_relative(review_dir / "AUDIT.json", run_dir),
+        _run_relative(review_dir / "MANUAL_EVIDENCE.json", run_dir),
+    }
+    for path in review_dir.glob("harness-evidence/*/*"):
+        if path.is_file():
+            evidence_paths.add(_run_relative(path, run_dir))
+    for item in manual["files"]:
+        evidence_paths.add(_run_relative(review_dir / item["path"], run_dir))
+    final = {
+        "schema_version": review_protocol.FINAL_SCHEMA,
+        "artifact_id": artifact_id,
+        "policy_sha256": policy_digest,
+        "plan_sha256": review_protocol.plan_sha256(plan),
+        "round": index,
+        "verdict": verdict,
+        "reason_codes": reason_codes,
+        "plan_path": _run_relative(_review_plan_path(run_dir, index), run_dir),
+        "checks_path": _run_relative(_review_checks_path(run_dir, index), run_dir),
+        "audit_path": _run_relative(review_dir / "AUDIT.json", run_dir),
+        "verification_path": _run_relative(_verification_path(run_dir, index), run_dir),
+        "manual_evidence_path": _run_relative(review_dir / "MANUAL_EVIDENCE.json", run_dir),
+        "evidence_paths": sorted(evidence_paths),
+        "decided_at": now(),
+    }
+    if write_result:
+        write_json(_final_review_path(run_dir, index), final)
+    return final
+
+
+def _read_final_review_v2(
+    run_dir: Path,
+    index: int,
+    *,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    artifact: dict[str, Any],
+    worker_result: dict[str, Any],
+) -> dict[str, Any]:
+    path = _final_review_path(run_dir, index)
+    final = read_handoff(path)
+    _policy, policy_digest = _review_policy(config)
+    plan = _read_review_plan_v2(
+        run_dir,
+        index,
+        state=state,
+        config=config,
+        artifact_id=str(artifact["sha256"]),
+        worker_result=worker_result,
+    )
+    try:
+        final = review_protocol.validate_final_review(
+            final,
+            artifact_id=str(artifact["sha256"]),
+            round_index=index,
+            policy_sha256=policy_digest,
+            plan_sha256_value=review_protocol.plan_sha256(plan),
+        )
+    except review_protocol.ReviewProtocolError as error:
+        raise HarnessError(f"Invalid Harness final review: {path}: {error}") from error
+    recalculated = _adjudicate_review_v2(
+        run_dir,
+        index,
+        state=state,
+        config=config,
+        artifact=artifact,
+        worker_result=worker_result,
+        write_result=False,
+    )
+    for field in (
+        "schema_version",
+        "artifact_id",
+        "policy_sha256",
+        "plan_sha256",
+        "round",
+        "verdict",
+        "reason_codes",
+        "plan_path",
+        "checks_path",
+        "audit_path",
+        "verification_path",
+        "manual_evidence_path",
+        "evidence_paths",
+    ):
+        if final[field] != recalculated[field]:
+            raise HarnessError(f"Final review no longer matches its underlying evidence: {field}")
+    return final
+
+
+def _review_artifact_v2(run_dir: Path, index: int, candidate_workspace: Path) -> dict[str, Any]:
+    path = _review_dir(run_dir, index) / "artifact.json"
+    artifact = read_private_json(path)
+    current = _workspace_manifest(candidate_workspace)
+    if artifact != current or artifact.get("schema_version") != ARTIFACT_SCHEMA:
+        raise HarnessError("Review v2 artifact identity no longer matches the candidate workspace")
+    return artifact
+
+
+def _review_feedback_v2(run_dir: Path, index: int) -> str:
+    review_dir = _review_dir(run_dir, index)
+    sections = []
+    for label, path in (
+        ("Harness final review", review_dir / "FINAL_REVIEW.json"),
+        ("Independent audit", review_dir / "AUDIT.json"),
+        ("Harness review checks", review_dir / "REVIEW_CHECKS.json"),
+        ("Review plan", review_dir / "REVIEW_PLAN.json"),
+    ):
+        sections.append(f"## {label}\n\n{path.read_text(encoding='utf-8') if path.is_file() else 'Unavailable.'}")
+    return "\n\n".join(sections)
+
+
+def _execute_review_v2_stage(
+    run_dir: Path,
+    *,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    candidate_workspace: Path,
+    reviewer_name: str,
+    timeout: int,
+) -> int | None:
+    index = int(state.get("review_index", 0))
+    phase = str(state.get("phase", ""))
+    review_dir = _review_dir(run_dir, index)
+    worker_path, worker_result = _worker_result(run_dir, index)
+    policy, policy_digest = _review_policy(config)
+
+    if phase == "review_plan":
+        _assert_live_workspace_unchanged(run_dir)
+        artifact = _workspace_manifest(candidate_workspace)
+        for path in (
+            review_dir / "artifact.json",
+            review_dir / "REVIEW_PLAN.json",
+            review_dir / "REVIEW_CHECKS.json",
+            review_dir / "AUDIT.json",
+            review_dir / "MANUAL_EVIDENCE.json",
+            review_dir / "FINAL_REVIEW.json",
+            review_dir / "harness-evidence",
+            review_dir / "reviewer-evidence",
+        ):
+            _quarantine(path)
+        write_json(review_dir / "artifact.json", artifact)
+        verification = _read_verification(
+            run_dir,
+            index,
+            str(artifact["sha256"]),
+            config["verification_commands"],
+        )
+        claims = _derived_worker_claims(worker_result)
+        subjects = {
+            "canonical_requirement": {
+                "id": "REQ-REQUEST",
+                "source": "user_request",
+                "statement": str(state["request"]),
+                "criticality": "must",
+            },
+            "worker_claims": claims,
+        }
+        _update_state(
+            run_dir,
+            status="PLANNING_REVIEW",
+            artifact_id=artifact["sha256"],
+            artifact_path=_run_relative(review_dir / "artifact.json", run_dir),
+        )
+        append_event(run_dir, "review_plan_started", index=index, artifact_id=artifact["sha256"])
+        _run_review_agent_stage(
+            run_dir=run_dir,
+            candidate_workspace=candidate_workspace,
+            artifact=artifact,
+            reviewer_name=reviewer_name,
+            config=config,
+            timeout=timeout,
+            prompt_name="review_planner",
+            prompt_values={
+                "request": str(state["request"]),
+                "run_dir": str(run_dir),
+                "worker_report": f"Path: {worker_path}\n\n{json.dumps(worker_result, ensure_ascii=False, indent=2)}",
+                "verification_report": json.dumps(verification, ensure_ascii=False, indent=2),
+                "review_dir": str(review_dir),
+                "artifact_id": str(artifact["sha256"]),
+                "review_round": str(index),
+                "review_policy": json.dumps(policy, ensure_ascii=False, indent=2),
+                "policy_sha256": policy_digest,
+                "review_subjects": json.dumps(subjects, ensure_ascii=False, indent=2),
+            },
+            prompt_path=review_dir / "planner-prompt.md",
+            log_path=review_dir / "planner.log",
+            protected_files=(worker_path, _verification_path(run_dir, index), review_dir / "artifact.json"),
+            actor="Review planner",
+        )
+        plan = _read_review_plan_v2(
+            run_dir,
+            index,
+            state=state,
+            config=config,
+            artifact_id=str(artifact["sha256"]),
+            worker_result=worker_result,
+        )
+        append_event(
+            run_dir,
+            "review_plan_recorded",
+            index=index,
+            plan_sha256=review_protocol.plan_sha256(plan),
+            checks=len(plan["checks"]),
+        )
+        _update_state(run_dir, phase="review_checks", status="RUNNING_REVIEW_CHECKS")
+        refresh_report(run_dir)
+        return None
+
+    artifact = _review_artifact_v2(run_dir, index, candidate_workspace)
+    plan = _read_review_plan_v2(
+        run_dir,
+        index,
+        state=state,
+        config=config,
+        artifact_id=str(artifact["sha256"]),
+        worker_result=worker_result,
+    )
+    if phase == "review_checks":
+        _update_state(run_dir, status="RUNNING_REVIEW_CHECKS")
+        append_event(run_dir, "review_checks_started", index=index)
+        checks = _run_planned_review_checks(
+            run_dir,
+            index,
+            candidate_workspace,
+            artifact,
+            plan,
+            config,
+        )
+        append_event(
+            run_dir,
+            "review_checks_recorded",
+            index=index,
+            pass_count=sum(result["status"] == "pass" for result in checks["results"]),
+            fail_count=sum(result["status"] == "fail" for result in checks["results"]),
+            error_count=sum(result["status"] == "error" for result in checks["results"]),
+            not_run_count=sum(result["status"] == "not_run" for result in checks["results"]),
+        )
+        _update_state(run_dir, phase="review_assess", status="REVIEWING")
+        refresh_report(run_dir)
+        return None
+
+    checks = _read_review_checks_v2(
+        run_dir,
+        index,
+        plan=plan,
+        artifact_id=str(artifact["sha256"]),
+        config=config,
+    )
+    if phase == "review_assess":
+        for path in (
+            review_dir / "AUDIT.json",
+            review_dir / "MANUAL_EVIDENCE.json",
+            review_dir / "FINAL_REVIEW.json",
+            review_dir / "reviewer-evidence",
+        ):
+            _quarantine(path)
+        verification = _read_verification(
+            run_dir,
+            index,
+            str(artifact["sha256"]),
+            config["verification_commands"],
+        )
+        _update_state(run_dir, status="REVIEWING")
+        append_event(run_dir, "review_assessment_started", index=index)
+        try:
+            _run_review_agent_stage(
+                run_dir=run_dir,
+                candidate_workspace=candidate_workspace,
+                artifact=artifact,
+                reviewer_name=reviewer_name,
+                config=config,
+                timeout=timeout,
+                prompt_name="reviewer_v2",
+                prompt_values={
+                    "request": str(state["request"]),
+                    "run_dir": str(run_dir),
+                    "worker_report": f"Path: {worker_path}\n\n{json.dumps(worker_result, ensure_ascii=False, indent=2)}",
+                    "verification_report": json.dumps(verification, ensure_ascii=False, indent=2),
+                    "review_dir": str(review_dir),
+                    "artifact_id": str(artifact["sha256"]),
+                    "review_plan": json.dumps(plan, ensure_ascii=False, indent=2),
+                    "review_checks": json.dumps(checks, ensure_ascii=False, indent=2),
+                    "plan_sha256": review_protocol.plan_sha256(plan),
+                },
+                prompt_path=review_dir / "reviewer-prompt.md",
+                log_path=review_dir / "reviewer.log",
+                protected_files=(
+                    worker_path,
+                    _verification_path(run_dir, index),
+                    review_dir / "artifact.json",
+                    review_dir / "REVIEW_PLAN.json",
+                    review_dir / "REVIEW_CHECKS.json",
+                ),
+                actor="Reviewer",
+            )
+        except HarnessError:
+            _update_state(run_dir, phase="review_checks", status="PAUSED")
+            raise
+        audit = _read_audit_v2(run_dir, index, plan=plan, checks=checks)
+        _record_manual_evidence(run_dir, index, plan=plan, audit=audit)
+        append_event(run_dir, "review_audit_recorded", index=index, verdict=audit["verdict"])
+        _update_state(run_dir, phase="adjudicate", status="ADJUDICATING")
+        refresh_report(run_dir)
+        return None
+
+    if phase != "adjudicate":
+        raise HarnessError(f"Unknown Review v2 phase: {phase!r}")
+    _quarantine(_final_review_path(run_dir, index))
+    final = _adjudicate_review_v2(
+        run_dir,
+        index,
+        state=state,
+        config=config,
+        artifact=artifact,
+        worker_result=worker_result,
+        write_result=True,
+    )
+    append_event(
+        run_dir,
+        "final_review_decided",
+        index=index,
+        verdict=final["verdict"],
+        reason_codes=final["reason_codes"],
+    )
+    if final["verdict"] == "PASS":
+        _update_state(run_dir, phase="promote", status="PROMOTING", active_agent=None, last_error="")
+        refresh_report(run_dir)
+        return None
+    if final["verdict"] == "INCONCLUSIVE":
+        reason = "Review is inconclusive: " + ", ".join(final["reason_codes"] or ["unspecified limitation"])
+        _update_state(
+            run_dir,
+            phase="review_plan",
+            status="PAUSED",
+            active_agent=None,
+            last_error=reason,
+        )
+        append_event(run_dir, "review_inconclusive", index=index, reason_codes=final["reason_codes"])
+        refresh_report(run_dir)
+        print(f"INCONCLUSIVE: {run_dir}", flush=True)
+        return 2
+    if index + 1 >= int(config["max_reviews"]):
+        _update_state(
+            run_dir,
+            status="INCOMPLETE",
+            active_agent=None,
+            finished_at=now(),
+            last_error=f"Review limit reached with unresolved issues: {final['reason_codes']}",
+        )
+        refresh_report(run_dir)
+        print(f"INCOMPLETE: {run_dir}", flush=True)
+        return 1
+    (run_dir / "WORKER_RESULT.json").unlink(missing_ok=True)
+    _update_state(
+        run_dir,
+        phase="work",
+        status="REPAIRING",
+        review_index=index + 1,
+        artifact_id=None,
+        artifact_path=None,
+    )
+    refresh_report(run_dir)
+    return None
 
 
 def _remove_path(path: Path) -> None:
@@ -1776,6 +3198,15 @@ def _audit_paths(run_dir: Path) -> list[Path]:
 
 def refresh_report(run_dir: Path) -> None:
     state = read_json(run_dir / "state.json")
+    config = read_json(run_dir / "run-config.json")
+    protocol_version = _review_protocol_version(config)
+    final_review_verdict = None
+    for final_path in reversed(sorted((run_dir / "reviews").glob("*/FINAL_REVIEW.json"))):
+        try:
+            final_review_verdict = read_json(final_path).get("verdict")
+            break
+        except HarnessError:
+            continue
     lines = [
         "# Task report",
         "",
@@ -1786,6 +3217,8 @@ def refresh_report(run_dir: Path) -> None:
         f"- Coordinator detection: `{state.get('coordinator_detection', '')}`",
         f"- Worker: `{state.get('worker_agent', '')}`",
         f"- Independent reviewer: `{state.get('reviewer_agent', '')}`",
+        f"- Review protocol: v{protocol_version}",
+        f"- Current phase: `{state.get('phase', '')}`",
         f"- Review round: {int(state.get('review_index', 0)) + 1} / {state.get('max_reviews', 0)}",
         f"- Reviewed artifact: `{state.get('artifact_id', 'pending')}`",
         "",
@@ -1806,6 +3239,28 @@ def refresh_report(run_dir: Path) -> None:
         except HarnessError:
             label = "invalid verification report"
         lines.append(f"- [{path.parent.name} Harness verification]({_run_relative(path, run_dir)}) — {label}")
+    for path in sorted((run_dir / "reviews").glob("*/REVIEW_PLAN.json")):
+        try:
+            plan = read_json(path)
+            label = (
+                f"{len(plan.get('requirements', []))} requirements, "
+                f"{len(plan.get('worker_claims', []))} Worker claims, "
+                f"{len(plan.get('risks', []))} risks, {len(plan.get('checks', []))} checks"
+            )
+        except HarnessError:
+            label = "invalid review plan"
+        lines.append(f"- [{path.parent.name} review plan]({_run_relative(path, run_dir)}) — {label}")
+    for path in sorted((run_dir / "reviews").glob("*/REVIEW_CHECKS.json")):
+        try:
+            checks = read_json(path)
+            counts = {
+                status: sum(result.get("status") == status for result in checks.get("results", []))
+                for status in ("pass", "fail", "error", "not_run")
+            }
+            label = ", ".join(f"{status}={count}" for status, count in counts.items())
+        except HarnessError:
+            label = "invalid review checks"
+        lines.append(f"- [{path.parent.name} Harness review checks]({_run_relative(path, run_dir)}) — {label}")
     for path in _audit_paths(run_dir):
         try:
             audit = read_json(path)
@@ -1813,6 +3268,13 @@ def refresh_report(run_dir: Path) -> None:
         except HarnessError:
             label = "invalid audit"
         lines.append(f"- [{path.parent.name} audit]({_run_relative(path, run_dir)}) — {label}")
+    for path in sorted((run_dir / "reviews").glob("*/FINAL_REVIEW.json")):
+        try:
+            final = read_json(path)
+            label = f"{final.get('verdict', 'UNKNOWN')} — {', '.join(final.get('reason_codes', [])) or 'all gates passed'}"
+        except HarnessError:
+            label = "invalid final review"
+        lines.append(f"- [{path.parent.name} Harness final review]({_run_relative(path, run_dir)}) — {label}")
     if state.get("last_error"):
         lines.extend(["", "## Last error", "", str(state["last_error"])])
     lines.extend(
@@ -1823,6 +3285,7 @@ def refresh_report(run_dir: Path) -> None:
             "- [Harness log](harness.log)",
             "- `iterations/*/worker.log`",
             "- `iterations/*/verification.log`",
+            "- `reviews/*/planner.log`",
             "- `reviews/*/reviewer.log`",
             "",
         ]
@@ -1841,9 +3304,12 @@ def refresh_report(run_dir: Path) -> None:
             "coordinator_detection": state.get("coordinator_detection"),
             "worker_agent": state.get("worker_agent"),
             "reviewer_agent": state.get("reviewer_agent"),
+            "review_protocol_version": protocol_version,
+            "phase": state.get("phase"),
             "artifact_id": state.get("artifact_id"),
             "artifact_path": state.get("artifact_path"),
             "review_count": len(_audit_paths(run_dir)),
+            "final_review_verdict": final_review_verdict,
             "finished_at": state.get("finished_at"),
         },
     )
@@ -1870,6 +3336,7 @@ def execute_run(run_dir: Path) -> int:
         config = read_json(config_path)
         if state.get("schema_version") != STATE_SCHEMA or config.get("schema_version") != STATE_SCHEMA:
             raise HarnessError(f"Unsupported run format (legacy runs are not resumed by this runner): {run_dir}")
+        protocol_version = _review_protocol_version(config)
         if str(state.get("status", "")).upper() in TERMINAL_STATUSES:
             refresh_report(run_dir)
             return 0 if state["status"] == "COMPLETE" else 1
@@ -1932,21 +3399,38 @@ def execute_run(run_dir: Path) -> int:
 
                 if state.get("phase") == "promote":
                     review_dir = run_dir / "reviews" / f"{index:02d}"
-                    audit = _audit_result(review_dir / "AUDIT.json")
-                    accepted_artifact = read_json(review_dir / "artifact.json")
-                    accepted_id = str(accepted_artifact.get("sha256", ""))
-                    verification = _read_verification(
-                        run_dir,
-                        index,
-                        accepted_id,
-                        config["verification_commands"],
+                    accepted_artifact = (
+                        _review_artifact_v2(run_dir, index, candidate_workspace)
+                        if protocol_version == 2
+                        else read_private_json(review_dir / "artifact.json")
                     )
-                    if (
-                        str(audit.get("verdict", "")).upper() != "PASS"
-                        or audit.get("artifact_id") != accepted_id
-                        or verification.get("status") != "pass"
-                    ):
-                        raise HarnessError("The promotion gate no longer matches the accepted review evidence")
+                    accepted_id = str(accepted_artifact.get("sha256", ""))
+                    if protocol_version == 2:
+                        _worker_path, worker_result = _worker_result(run_dir, index)
+                        final = _read_final_review_v2(
+                            run_dir,
+                            index,
+                            state=state,
+                            config=config,
+                            artifact=accepted_artifact,
+                            worker_result=worker_result,
+                        )
+                        if final["verdict"] != "PASS":
+                            raise HarnessError("The Review v2 promotion gate is not PASS")
+                    else:
+                        audit = _audit_result(review_dir / "AUDIT.json")
+                        verification = _read_verification(
+                            run_dir,
+                            index,
+                            accepted_id,
+                            config["verification_commands"],
+                        )
+                        if (
+                            str(audit.get("verdict", "")).upper() != "PASS"
+                            or audit.get("artifact_id") != accepted_id
+                            or verification.get("status") != "pass"
+                        ):
+                            raise HarnessError("The promotion gate no longer matches the accepted review evidence")
                     promoted = _promote_candidate(run_dir, accepted_artifact)
                     if promoted["sha256"] != accepted_id:
                         raise HarnessError("Promoted workspace does not match the accepted artifact")
@@ -1987,8 +3471,11 @@ def execute_run(run_dir: Path) -> int:
                     if not result_path.is_file():
                         feedback = "No review feedback; this is the initial implementation."
                         if index:
-                            previous = run_dir / "reviews" / f"{index - 1:02d}" / "AUDIT.json"
-                            feedback = previous.read_text(encoding="utf-8") if previous.is_file() else "Previous audit is unavailable."
+                            if protocol_version == 2:
+                                feedback = _review_feedback_v2(run_dir, index - 1)
+                            else:
+                                previous = run_dir / "reviews" / f"{index - 1:02d}" / "AUDIT.json"
+                                feedback = previous.read_text(encoding="utf-8") if previous.is_file() else "Previous audit is unavailable."
                         status = "WORKING" if index == 0 else "REPAIRING"
                         _update_state(run_dir, status=status)
                         print(f"[{index + 1}] {status.lower()} with {worker_name}", flush=True)
@@ -2046,12 +3533,42 @@ def execute_run(run_dir: Path) -> int:
                         _quarantine(result_path)
                         _quarantine(run_dir / "WORKER_RESULT.json")
                         raise
+                    if protocol_version == 2:
+                        _update_state(run_dir, phase="verify", status="VERIFYING")
+                        refresh_report(run_dir)
+                        continue
                     try:
                         _run_verification(run_dir, index, candidate_workspace, config)
                     finally:
                         _assert_live_workspace_unchanged(run_dir)
                     _update_state(run_dir, phase="review", status="REVIEWING")
                     refresh_report(run_dir)
+                    continue
+
+                if protocol_version == 2 and state.get("phase") == "verify":
+                    if not _is_real_directory(candidate_workspace):
+                        raise HarnessError("The isolated candidate workspace is unavailable")
+                    _assert_live_workspace_unchanged(run_dir)
+                    _update_state(run_dir, status="VERIFYING")
+                    try:
+                        _run_verification(run_dir, index, candidate_workspace, config)
+                    finally:
+                        _assert_live_workspace_unchanged(run_dir)
+                    _update_state(run_dir, phase="review_plan", status="PLANNING_REVIEW")
+                    refresh_report(run_dir)
+                    continue
+
+                if protocol_version == 2:
+                    outcome = _execute_review_v2_stage(
+                        run_dir,
+                        state=state,
+                        config=config,
+                        candidate_workspace=candidate_workspace,
+                        reviewer_name=reviewer_name,
+                        timeout=timeout,
+                    )
+                    if outcome is not None:
+                        return outcome
                     continue
 
                 if state.get("phase") != "review":

@@ -58,6 +58,11 @@ else:
     prompt_path = Path(prompt_value)
 state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
 index = int(state.get("review_index", 0))
+prompt_text = prompt_path.read_text(encoding="utf-8")
+review_stage = ""
+for line in prompt_text.splitlines()[:3]:
+    if line.startswith("HARNESS_REVIEW_STAGE:"):
+        review_stage = line.partition(":")[2].strip()
 scenario_path = run_dir / "fake-scenario.json"
 scenario = json.loads(scenario_path.read_text(encoding="utf-8")) if scenario_path.is_file() else {}
 event = {
@@ -67,6 +72,7 @@ event = {
     "index": index,
     "workspace": str(workspace),
     "prompt": prompt_path.relative_to(run_dir).as_posix(),
+    "review_stage": review_stage,
     "workspace_git_exists": (workspace / ".git").exists(),
 }
 live_workspace = Path(state["workspace"])
@@ -170,13 +176,209 @@ if role == "TASK_WORKER":
         raise SystemExit(7)
     raise SystemExit(0)
 
-mode = scenario.get("audit_mode", "valid")
 review_dir = prompt_path.parent
 review_dir.mkdir(parents=True, exist_ok=True)
+if review_stage == "PLAN":
+    mode = scenario.get("plan_mode", "valid")
+    if mode == "missing":
+        raise SystemExit(0)
+    if mode == "invalid_json":
+        (review_dir / "REVIEW_PLAN.json").write_text("{not-json", encoding="utf-8")
+        raise SystemExit(0)
+    run_config = json.loads((run_dir / "run-config.json").read_text(encoding="utf-8"))
+    policy = run_config["review_policy"]
+    artifact = json.loads((review_dir / "artifact.json").read_text(encoding="utf-8"))
+    worker_result = json.loads(
+        (run_dir / "iterations" / f"{index:02d}" / "WORKER_RESULT.json").read_text(encoding="utf-8")
+    )
+    claims = [{"id": "CLAIM-SUMMARY", "statement": worker_result["summary"]}]
+    for claim_index, check in enumerate(worker_result["checks"], start=1):
+        claims.append(
+            {
+                "id": f"CLAIM-CHECK-{claim_index:03d}",
+                "statement": f"{check['name']} [{str(check['status']).lower()}]: {check['details']}",
+            }
+        )
+    risks = []
+    for risk_index, category in enumerate(policy["required_risk_categories"], start=1):
+        applicable = risk_index == 1
+        risks.append(
+            {
+                "id": f"RISK-{risk_index:03d}",
+                "category": category,
+                "statement": f"Review the {category} risk for this task.",
+                "applicability": "applicable" if applicable else "not_applicable",
+                "rationale": "Relevant to the fixture." if applicable else "Not relevant to this fixture.",
+                "severity_if_real": "major" if applicable else "minor",
+            }
+        )
+    covered = ["REQ-REQUEST", *[claim["id"] for claim in claims], risks[0]["id"]]
+    if scenario.get("plan_coverage_gap"):
+        covered = [claim["id"] for claim in claims]
+    command = scenario.get("plan_command", [sys.executable, "-c", "pass"])
+    checks = [
+        {
+            "id": "CHK-COMMAND",
+            "kind": "command",
+            "purpose": "Run the fixture review check.",
+            "covers": covered,
+            "expected": {"exit_codes": list(scenario.get("plan_exit_codes", [0]))},
+            "blocking": True,
+            "steps": list(scenario.get("plan_steps", [command])),
+            "timeout_seconds": int(scenario.get("plan_timeout", 5)),
+        },
+        {
+            "id": "CHK-INSPECTION",
+            "kind": "inspection",
+            "purpose": "Inspect the fixture delivery.",
+            "covers": ["REQ-REQUEST"],
+            "expected": {"description": "The requested fixture is present."},
+            "blocking": False,
+        },
+    ]
+    if scenario.get("extra_plan_command"):
+        checks.append(
+            {
+                "id": "CHK-COMMAND-2",
+                "kind": "command",
+                "purpose": "Run a second isolated fixture check.",
+                "covers": ["REQ-REQUEST"],
+                "expected": {"exit_codes": [0]},
+                "blocking": True,
+                "steps": [scenario["extra_plan_command"]],
+                "timeout_seconds": int(scenario.get("plan_timeout", 5)),
+            }
+        )
+    plan = {
+        "schema_version": "generic-harness/review-plan/v1",
+        "artifact_id": "b" * 64 if mode == "wrong_artifact" else artifact["sha256"],
+        "policy_sha256": run_config["review_policy_sha256"],
+        "round": index,
+        "summary": "Review the fixture delivery.",
+        "requirements": [
+            {
+                "id": "REQ-REQUEST",
+                "source": "user_request",
+                "statement": state["request"],
+                "criticality": "must",
+            }
+        ],
+        "worker_claims": claims,
+        "risks": risks,
+        "checks": checks,
+        "limitations": [],
+    }
+    (review_dir / "REVIEW_PLAN.json").write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+    raise SystemExit(0)
+
+mode = scenario.get("audit_mode", "valid")
 if mode == "missing":
     raise SystemExit(0)
 if mode == "invalid_json":
     (review_dir / "AUDIT.json").write_text("{not-json", encoding="utf-8")
+    raise SystemExit(0)
+if review_stage == "ASSESS":
+    plan = json.loads((review_dir / "REVIEW_PLAN.json").read_text(encoding="utf-8"))
+    check_bundle = json.loads((review_dir / "REVIEW_CHECKS.json").read_text(encoding="utf-8"))
+    command_results = {result["check_id"]: result["status"] for result in check_bundle["results"]}
+    manual_results = []
+    reviewer_evidence = review_dir / "reviewer-evidence"
+    reviewer_evidence.mkdir(parents=True, exist_ok=True)
+    for check in plan["checks"]:
+        if check["kind"] == "command":
+            continue
+        manual_status = str(scenario.get("manual_status", "pass"))
+        evidence_refs = []
+        if manual_status == "pass":
+            evidence = reviewer_evidence / f"{check['id']}.txt"
+            evidence.write_text("Inspected the fixture delivery.\n", encoding="utf-8")
+            evidence_refs = [f"reviewer-evidence/{check['id']}.txt"]
+        manual_results.append(
+            {
+                "check_id": check["id"],
+                "status": manual_status,
+                "details": "Observed the delivered workspace.",
+                "evidence_refs": evidence_refs,
+            }
+        )
+    outcomes = {**command_results, **{result["check_id"]: result["status"] for result in manual_results}}
+    coverage = []
+    subjects = [*plan["requirements"], *plan["worker_claims"]]
+    subjects.extend(risk for risk in plan["risks"] if risk["applicability"] != "not_applicable")
+    for subject in subjects:
+        passing = [
+            check["id"]
+            for check in plan["checks"]
+            if subject["id"] in check["covers"] and outcomes.get(check["id"]) == "pass"
+        ]
+        coverage.append(
+            {
+                "subject_id": subject["id"],
+                "status": "covered" if passing else "uncovered",
+                "evidence_refs": passing,
+            }
+        )
+    if mode == "invalid_verdict":
+        verdict = "MAYBE"
+    else:
+        verdicts = scenario.get("verdicts", [scenario.get("v2_verdict", "PASS")])
+        verdict = verdicts[min(index, len(verdicts) - 1)]
+    issues = []
+    if verdict == "FIX":
+        issues.append(
+            {
+                "severity": "major",
+                "location": "index.html",
+                "title": "Checkout needs repair",
+                "evidence": "The requested checkout behavior is incomplete.",
+                "evidence_refs": ["CHK-INSPECTION"],
+                "required_fix": "Complete checkout behavior.",
+                "acceptance_test": "Exercise checkout from cart to confirmation.",
+            }
+        )
+        for minor_index in range(int(scenario.get("minor_count", 0))):
+            issues.append(
+                {
+                    "severity": "minor",
+                    "location": "index.html",
+                    "title": f"Minor issue {minor_index + 1} also needs repair",
+                    "evidence": f"Observed minor issue {minor_index + 1}.",
+                    "evidence_refs": ["CHK-INSPECTION"],
+                    "required_fix": f"Resolve minor issue {minor_index + 1}.",
+                    "acceptance_test": f"Verify minor issue {minor_index + 1} after repair.",
+                }
+            )
+    if scenario.get("minor_only") and issues:
+        issues[0]["severity"] = "minor"
+    if scenario.get("reviewer_modifies_workspace"):
+        (workspace / "reviewer-touched.txt").write_text("not allowed\n", encoding="utf-8")
+    if scenario.get("reviewer_modifies_live_workspace"):
+        (Path(state["workspace"]) / "reviewer-touched.txt").write_text("not allowed\n", encoding="utf-8")
+    if scenario.get("reviewer_modifies_candidate_workspace"):
+        (Path(state["candidate_workspace"]) / "reviewer-injected.txt").write_text("not allowed\n", encoding="utf-8")
+    if scenario.get("reviewer_tampers_review_log"):
+        log_path = next((review_dir / "harness-evidence").glob("*/*.log"))
+        log_path.write_text("tampered\n", encoding="utf-8")
+    if scenario.get("reviewer_adds_harness_evidence"):
+        (review_dir / "harness-evidence" / "unexpected.txt").write_text(
+            "not Harness owned\n", encoding="utf-8"
+        )
+    audit = {
+        "schema_version": "generic-harness/audit/v2",
+        "artifact_id": plan["artifact_id"],
+        "plan_sha256": __import__("hashlib").sha256(
+            json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "verdict": verdict,
+        "summary": "Checkout needs repair." if verdict == "FIX" else "Independent checks completed.",
+        "coverage": coverage,
+        "checks": manual_results,
+        "issues": issues,
+        "limitations": ["Fixture limitation."] if verdict == "INCONCLUSIVE" else [],
+    }
+    (review_dir / "AUDIT.json").write_text(json.dumps(audit, ensure_ascii=False), encoding="utf-8")
+    if scenario.get("reviewer_exit_nonzero"):
+        raise SystemExit(7)
     raise SystemExit(0)
 if mode == "invalid_verdict":
     verdict = "MAYBE"
@@ -308,6 +510,25 @@ class FakeHarnessEnvironment:
         config["verification_timeout_seconds"] = timeout
         self.config.write_text(json.dumps(config), encoding="utf-8")
 
+    def enable_review_v2(self, **policy_overrides) -> None:
+        config = json.loads(self.config.read_text(encoding="utf-8"))
+        policy = {
+            "require_plan": True,
+            "require_requirement_coverage": True,
+            "require_worker_claim_coverage": True,
+            "max_dynamic_checks": 8,
+            "max_steps_per_check": 3,
+            "per_check_timeout_seconds": 10,
+            "total_check_timeout_seconds": 20,
+            "max_log_bytes_per_step": 4096,
+            "allowed_check_kinds": ["command", "inspection", "visual"],
+            "required_risk_categories": ["functional_correctness"],
+        }
+        policy.update(policy_overrides)
+        config["review_protocol_version"] = 2
+        config["review_policy"] = policy
+        self.config.write_text(json.dumps(config), encoding="utf-8")
+
     @staticmethod
     def set_scenario(run_dir: Path, **scenario) -> None:
         (run_dir / "fake-scenario.json").write_text(json.dumps(scenario), encoding="utf-8")
@@ -397,6 +618,239 @@ class HarnessTests(unittest.TestCase):
             self.assertNotIn(obsolete_gate, prompts)
         self.assertFalse((run_dir / "manifest.json").exists())
         self.assertFalse((run_dir / "review-schema.json").exists())
+
+    def test_review_v2_plans_runs_checks_adjudicates_and_promotes(self):
+        self.environment.enable_review_v2(max_log_bytes_per_step=16)
+        self.environment.set_verification(
+            [[sys.executable, "-c", "import os; assert 'HARNESS_TEST_SECRET' not in os.environ"]]
+        )
+        run_dir = self.environment.create_run("Build a reviewed fixture.")
+        first_step = (
+            "import os,sys; "
+            "assert 'HARNESS_TEST_SECRET' not in os.environ; "
+            "open('shared-step.txt','w').write('shared'); "
+            "open('review-check-only.txt','w').write('temporary'); "
+            "print('stdout-' + 'x'*30); "
+            "print('stderr-evidence', file=sys.stderr)"
+        )
+        second_step = "from pathlib import Path; assert Path('shared-step.txt').read_text() == 'shared'"
+        self.environment.set_scenario(
+            run_dir,
+            plan_steps=[
+                [sys.executable, "-c", first_step],
+                [sys.executable, "-c", second_step],
+            ],
+            extra_plan_command=[
+                sys.executable,
+                "-c",
+                "from pathlib import Path; assert not Path('shared-step.txt').exists()",
+            ],
+        )
+
+        with patch.dict(os.environ, {"HARNESS_TEST_SECRET": "must-not-leak"}):
+            self.assertEqual(harness.execute_run(run_dir), 0)
+
+        state = harness.read_json(run_dir / "state.json")
+        review_dir = run_dir / "reviews" / "00"
+        final = harness.read_json(review_dir / "FINAL_REVIEW.json")
+        bundle = harness.read_json(review_dir / "REVIEW_CHECKS.json")
+        step = bundle["results"][0]["steps"][0]
+        self.assertEqual((state["status"], final["verdict"]), ("COMPLETE", "PASS"))
+        self.assertEqual(
+            [(event["role"], event["review_stage"]) for event in self.environment.events(run_dir)],
+            [("TASK_WORKER", ""), ("TASK_REVIEWER", "PLAN"), ("TASK_REVIEWER", "ASSESS")],
+        )
+        self.assertTrue(step["stdout_truncated"])
+        self.assertFalse(step["stderr_truncated"])
+        stdout_path = review_dir / step["stdout_path"]
+        stderr_path = review_dir / step["stderr_path"]
+        self.assertEqual(stdout_path.stat().st_size, 16)
+        self.assertIn("stderr-evidence", stderr_path.read_text(encoding="utf-8"))
+        self.assertEqual(harness._file_sha256(stdout_path), step["stdout_sha256"])
+        self.assertFalse((self.environment.workspace / "review-check-only.txt").exists())
+        self.assertEqual(len(bundle["results"][0]["steps"]), 2)
+        self.assertEqual(bundle["results"][1]["status"], "pass")
+        self.assertTrue((review_dir / "MANUAL_EVIDENCE.json").is_file())
+        self.assertTrue((review_dir / "reviewer-evidence" / "CHK-INSPECTION.txt").is_file())
+        self.assertTrue(all(path.startswith("reviews/00/") or path.startswith("iterations/00/") for path in final["evidence_paths"]))
+
+    def test_review_v2_bounds_time_and_marks_later_checks_not_run(self):
+        self.environment.enable_review_v2(
+            per_check_timeout_seconds=1,
+            total_check_timeout_seconds=1,
+        )
+        run_dir = self.environment.create_run("Bound planned review checks.", max_reviews=1)
+        self.environment.set_scenario(
+            run_dir,
+            plan_command=[sys.executable, "-c", "import time; time.sleep(5)"],
+            plan_timeout=1,
+            extra_plan_command=[sys.executable, "-c", "pass"],
+            v2_verdict="PASS",
+        )
+
+        self.assertEqual(harness.execute_run(run_dir), 1)
+
+        bundle = harness.read_json(run_dir / "reviews" / "00" / "REVIEW_CHECKS.json")
+        self.assertEqual([result["status"] for result in bundle["results"]], ["fail", "not_run"])
+        self.assertTrue(bundle["results"][0]["steps"][0]["timed_out"])
+        final = harness.read_json(run_dir / "reviews" / "00" / "FINAL_REVIEW.json")
+        self.assertEqual(final["verdict"], "FIX")
+        self.assertIn("BLOCKING_CHECK_FAILED", final["reason_codes"])
+        self.assertFalse((self.environment.workspace / "index.html").exists())
+
+    def test_review_v2_revalidates_log_hashes_at_promotion(self):
+        self.environment.enable_review_v2()
+        run_dir = self.environment.create_run("Revalidate final review evidence.")
+        with patch.object(
+            harness,
+            "_promote_candidate",
+            side_effect=harness.HarnessError("hold promotion for evidence test"),
+        ):
+            with self.assertRaisesRegex(harness.HarnessError, "hold promotion"):
+                harness.execute_run(run_dir)
+
+        state = harness.read_json(run_dir / "state.json")
+        self.assertEqual((state["status"], state["phase"]), ("PAUSED", "promote"))
+        bundle = harness.read_json(run_dir / "reviews" / "00" / "REVIEW_CHECKS.json")
+        log = run_dir / "reviews" / "00" / bundle["results"][0]["steps"][0]["stdout_path"]
+        log.write_text("tampered after adjudication\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(harness.HarnessError, "hash does not match"):
+            harness.execute_run(run_dir)
+        self.assertFalse((self.environment.workspace / "index.html").exists())
+
+    def test_review_v2_revalidates_complete_artifact_manifest_at_promotion(self):
+        self.environment.enable_review_v2()
+        run_dir = self.environment.create_run("Revalidate the complete artifact manifest.")
+        with patch.object(
+            harness,
+            "_promote_candidate",
+            side_effect=harness.HarnessError("hold promotion for artifact test"),
+        ):
+            with self.assertRaisesRegex(harness.HarnessError, "hold promotion"):
+                harness.execute_run(run_dir)
+
+        state = harness.read_json(run_dir / "state.json")
+        self.assertEqual((state["status"], state["phase"]), ("PAUSED", "promote"))
+        artifact_path = run_dir / "reviews" / "00" / "artifact.json"
+        artifact = harness.read_json(artifact_path)
+        harness.write_json(artifact_path, {"sha256": artifact["sha256"]})
+
+        with self.assertRaisesRegex(harness.HarnessError, "artifact identity"):
+            harness.execute_run(run_dir)
+        self.assertFalse((self.environment.workspace / "index.html").exists())
+
+    def test_review_v2_harness_overrides_false_pass_with_fix(self):
+        self.environment.enable_review_v2()
+        run_dir = self.environment.create_run("Reject a failing planned check.", max_reviews=1)
+        self.environment.set_scenario(
+            run_dir,
+            plan_command=[sys.executable, "-c", "raise SystemExit(7)"],
+            v2_verdict="PASS",
+        )
+
+        self.assertEqual(harness.execute_run(run_dir), 1)
+
+        review_dir = run_dir / "reviews" / "00"
+        self.assertEqual(harness.read_json(review_dir / "AUDIT.json")["verdict"], "PASS")
+        final = harness.read_json(review_dir / "FINAL_REVIEW.json")
+        self.assertEqual(final["verdict"], "FIX")
+        self.assertIn("BLOCKING_CHECK_FAILED", final["reason_codes"])
+        self.assertFalse((self.environment.workspace / "index.html").exists())
+
+    def test_review_v2_inconclusive_retries_same_round_after_environment_recovers(self):
+        self.environment.enable_review_v2()
+        run_dir = self.environment.create_run("Retry an unavailable planned check.")
+        self.environment.set_scenario(
+            run_dir,
+            plan_command=["definitely-missing-review-program"],
+            v2_verdict="PASS",
+        )
+
+        self.assertEqual(harness.execute_run(run_dir), 2)
+
+        state = harness.read_json(run_dir / "state.json")
+        final = harness.read_json(run_dir / "reviews" / "00" / "FINAL_REVIEW.json")
+        self.assertEqual((state["status"], state["phase"], state["review_index"]), ("PAUSED", "review_plan", 0))
+        self.assertEqual(final["verdict"], "INCONCLUSIVE")
+        self.assertIn("BLOCKING_CHECK_UNAVAILABLE", final["reason_codes"])
+        self.assertFalse((self.environment.workspace / "index.html").exists())
+
+        self.environment.set_scenario(run_dir)
+        self.assertEqual(harness.execute_run(run_dir), 0)
+        self.assertEqual(harness.read_json(run_dir / "state.json")["review_index"], 0)
+        self.assertTrue((self.environment.workspace / "index.html").is_file())
+
+    def test_review_v2_reexecutes_checks_after_reviewer_tampers_harness_log(self):
+        self.environment.enable_review_v2()
+        run_dir = self.environment.create_run("Protect Harness-owned review evidence.")
+        self.environment.set_scenario(run_dir, reviewer_tampers_review_log=True)
+
+        with self.assertRaisesRegex(harness.HarnessError, "protected Harness control data"):
+            harness.execute_run(run_dir)
+
+        state = harness.read_json(run_dir / "state.json")
+        self.assertEqual((state["status"], state["phase"]), ("PAUSED", "review_checks"))
+        self.assertFalse((self.environment.workspace / "index.html").exists())
+        self.environment.set_scenario(run_dir)
+        self.assertEqual(harness.execute_run(run_dir), 0)
+
+    def test_review_v2_rejects_unexpected_files_in_harness_evidence(self):
+        self.environment.enable_review_v2()
+        run_dir = self.environment.create_run("Keep Harness evidence exclusively owned.")
+        self.environment.set_scenario(run_dir, reviewer_adds_harness_evidence=True)
+
+        with self.assertRaisesRegex(harness.HarnessError, "protected Harness control data"):
+            harness.execute_run(run_dir)
+
+        state = harness.read_json(run_dir / "state.json")
+        self.assertEqual((state["status"], state["phase"]), ("PAUSED", "review_checks"))
+        self.assertFalse((self.environment.workspace / "index.html").exists())
+
+    @unittest.skipUnless(SYMLINKS_AVAILABLE, "symbolic-link creation is unavailable")
+    def test_control_guard_rejects_replaced_review_directory_symlink(self):
+        run_dir = self.environment.create_run("Protect review-directory identity.")
+        (run_dir / "harness.pid").write_text("{}\n", encoding="utf-8")
+        review_dir = run_dir / "reviews" / "00"
+        log_dir = review_dir / "harness-evidence" / "CHK-COMMAND"
+        log_dir.mkdir(parents=True)
+        harness.write_json(review_dir / "artifact.json", {"sha256": "a" * 64})
+        (log_dir / "step-1.stdout.log").write_text("unchanged evidence\n", encoding="utf-8")
+        guard = harness._control_guard(run_dir)
+
+        moved = run_dir / "00-real"
+        review_dir.rename(moved)
+        review_dir.symlink_to(moved, target_is_directory=True)
+
+        with self.assertRaisesRegex(harness.HarnessError, "protected Harness control data"):
+            harness._verify_control_guard(run_dir, guard)
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behavior")
+    def test_control_guard_rejects_replaced_review_directory_junction(self):
+        run_dir = self.environment.create_run("Protect review-directory identity on Windows.")
+        (run_dir / "harness.pid").write_text("{}\n", encoding="utf-8")
+        review_dir = run_dir / "reviews" / "00"
+        log_dir = review_dir / "harness-evidence" / "CHK-COMMAND"
+        log_dir.mkdir(parents=True)
+        harness.write_json(review_dir / "artifact.json", {"sha256": "a" * 64})
+        (log_dir / "step-1.stdout.log").write_text("unchanged evidence\n", encoding="utf-8")
+        guard = harness._control_guard(run_dir)
+
+        moved = run_dir / "00-real"
+        review_dir.rename(moved)
+        result = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(review_dir), str(moved)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            moved.rename(review_dir)
+            self.skipTest(f"junction creation is unavailable: {result.stderr or result.stdout}")
+        self.addCleanup(lambda: os.path.lexists(review_dir) and os.rmdir(review_dir))
+
+        with self.assertRaisesRegex(harness.HarnessError, "protected Harness control data"):
+            harness._verify_control_guard(run_dir, guard)
 
     def test_failing_cli_verification_blocks_promotion(self):
         self.environment.workspace.mkdir()
@@ -577,6 +1031,35 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(harness.execute_run(run_dir), 0)
         verification = harness.read_json(run_dir / "iterations" / "00" / "VERIFICATION.json")
         self.assertEqual([item["argv"] for item in verification["commands"]], passing)
+
+    def test_verification_report_cannot_forge_pass_against_process_evidence(self):
+        command = [sys.executable, "-c", "pass"]
+        run_dir = self.environment.create_run("Reject contradictory verification evidence.")
+        iteration_dir = run_dir / "iterations" / "00"
+        iteration_dir.mkdir(parents=True)
+        artifact_id = "a" * 64
+        report = {
+            "schema_version": harness.VERIFICATION_SCHEMA,
+            "artifact_id": artifact_id,
+            "status": "pass",
+            "commands": [
+                {
+                    "name": "verification 1",
+                    "argv": command,
+                    "command": harness.format_command(command),
+                    "status": "pass",
+                    "returncode": 7,
+                    "timed_out": False,
+                    "duration_seconds": 0.1,
+                    "details": "forged pass",
+                    "log": "iterations/00/verification.log",
+                }
+            ],
+        }
+        harness.write_json(iteration_dir / "VERIFICATION.json", report)
+
+        with self.assertRaisesRegex(harness.HarnessError, "Inconsistent deterministic verification"):
+            harness._read_verification(run_dir, 0, artifact_id, [command])
 
     def test_python_verification_placeholder_is_snapshotted_portably(self):
         self.environment.set_verification([["{python}", "-c", "pass"]])
@@ -990,6 +1473,18 @@ class HarnessTests(unittest.TestCase):
                 harness._windows_batch_argv_has_metacharacters(
                     [r"C:\safe\check.cmd", "literal value"],
                 )
+            )
+
+    def test_windows_command_line_limits_cover_batch_and_native_checks(self):
+        with patch.object(harness, "WINDOWS", True):
+            self.assertEqual(harness._windows_command_line_error([r"C:\safe\check.cmd", "short"]), "")
+            self.assertIn(
+                "safe Windows command-line limit",
+                harness._windows_command_line_error([r"C:\safe\check.cmd", "x" * 8_000]),
+            )
+            self.assertIn(
+                "safe Windows command-line limit",
+                harness._windows_command_line_error([r"C:\safe\check.exe", "x" * 30_000]),
             )
 
     @unittest.skipIf(os.name == "nt", "POSIX executable-bit behavior")
@@ -1671,6 +2166,48 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(state["status"], "PAUSED")
         self.assertIsInstance(state["active_agent"], dict)
         self.assertEqual(state["active_agent"]["role"], "DETERMINISTIC_VERIFIER")
+        self.assertTrue(state["active_agent"]["pid_started"])
+
+    def test_failed_review_check_state_publication_and_cleanup_persists_identity(self):
+        self.environment.enable_review_v2()
+        run_dir = self.environment.create_run(
+            "Persist review-check identity before any fallible state publication."
+        )
+        real_update = harness._update_state
+        real_terminate = harness._terminate
+        publication_failed = False
+
+        def fail_first_review_check_publication(target_run, **changes):
+            nonlocal publication_failed
+            active = changes.get("active_agent")
+            if (
+                not publication_failed
+                and isinstance(active, dict)
+                and active.get("role") == "REVIEW_CHECK"
+            ):
+                publication_failed = True
+                raise harness.HarnessError("simulated review-check state publication failure")
+            return real_update(target_run, **changes)
+
+        def fail_review_check_cleanup(process, grace=5.0):
+            if publication_failed:
+                real_terminate(process, grace)
+                raise harness.HarnessError("simulated review-check process-tree cleanup failure")
+            return real_terminate(process, grace)
+
+        with patch.object(
+            harness,
+            "_update_state",
+            side_effect=fail_first_review_check_publication,
+        ), patch.object(harness, "_terminate", side_effect=fail_review_check_cleanup):
+            with self.assertRaisesRegex(harness.HarnessError, "review-check process-tree cleanup failure"):
+                harness.execute_run(run_dir)
+
+        state = harness.read_json(run_dir / "state.json")
+        self.assertTrue(publication_failed)
+        self.assertEqual(state["status"], "PAUSED")
+        self.assertIsInstance(state["active_agent"], dict)
+        self.assertEqual(state["active_agent"]["role"], "REVIEW_CHECK")
         self.assertTrue(state["active_agent"]["pid_started"])
 
     def test_worker_blocker_is_preserved_and_continue_retries_work(self):

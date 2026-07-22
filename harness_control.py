@@ -551,6 +551,16 @@ def status_payload() -> dict[str, Any]:
     child_status, child_process = active_agent_identity(state)
     pid = supervisor_process if supervisor_status == "match" else None
     child_pid = child_process if child_status == "match" else None
+    config = safe_json(run_dir / "run-config.json")
+    review_dir = run_dir / "reviews" / f"{int(state.get('review_index', 0)):02d}"
+    plan = safe_json(review_dir / "REVIEW_PLAN.json")
+    review_checks = safe_json(review_dir / "REVIEW_CHECKS.json")
+    audit = safe_json(review_dir / "AUDIT.json")
+    final_review = safe_json(review_dir / "FINAL_REVIEW.json")
+    check_results = review_checks.get("results", []) if isinstance(review_checks.get("results"), list) else []
+    reviewer_verdict = audit.get("verdict")
+    final_verdict = final_review.get("verdict")
+    final_reasons = final_review.get("reason_codes")
     return {
         **state,
         "run_dir": str(run_dir),
@@ -561,6 +571,20 @@ def status_payload() -> dict[str, Any]:
         "child_agent_pid": child_pid,
         "child_agent_identity_status": child_status,
         "operator_paused": pause_requested(run_dir),
+        "review_protocol_version": config.get("review_protocol_version", 1),
+        "review_plan": {
+            "requirements": len(plan.get("requirements", [])) if isinstance(plan.get("requirements"), list) else 0,
+            "claims": len(plan.get("worker_claims", [])) if isinstance(plan.get("worker_claims"), list) else 0,
+            "risks": len(plan.get("risks", [])) if isinstance(plan.get("risks"), list) else 0,
+            "checks": len(plan.get("checks", [])) if isinstance(plan.get("checks"), list) else 0,
+        },
+        "review_checks": {
+            status: sum(isinstance(result, dict) and result.get("status") == status for result in check_results)
+            for status in ("pass", "fail", "error", "not_run")
+        },
+        "reviewer_verdict": reviewer_verdict if isinstance(reviewer_verdict, str) else None,
+        "final_review_verdict": final_verdict if isinstance(final_verdict, str) else None,
+        "final_review_reason_codes": final_reasons if isinstance(final_reasons, list) else [],
         "final_report": str(run_dir / "FINAL_REPORT.md") if (run_dir / "FINAL_REPORT.md").is_file() else None,
     }
 
@@ -597,6 +621,15 @@ def print_status(as_json: bool) -> int:
             )
         if payload.get("last_error"):
             print(tr(f"Latest error: {payload['last_error']}", f"最近错误：{payload['last_error']}"))
+        if payload.get("review_protocol_version") == 2:
+            print(
+                tr(
+                    f"Review v2: reviewer={payload.get('reviewer_verdict') or 'pending'} · "
+                    f"Harness={payload.get('final_review_verdict') or 'pending'}",
+                    f"Review v2：Reviewer={payload.get('reviewer_verdict') or '待定'} · "
+                    f"Harness={payload.get('final_review_verdict') or '待定'}",
+                )
+            )
         if payload.get("final_report"):
             print(tr(f"Report: {payload['final_report']}", f"报告：{payload['final_report']}"))
     return 0

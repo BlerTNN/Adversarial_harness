@@ -704,7 +704,8 @@ def resolve_program(executable: str, *, cwd: Path | None = None) -> str | None:
     # cwd on Windows: a candidate-controlled ``npm.cmd`` must not shadow the
     # configured system ``npm`` verification command.  Candidate-local tools
     # remain available through explicit paths such as ``.\\check.cmd``.
-    return shutil.which(executable)
+    found = shutil.which(executable)
+    return str(Path(found).resolve()) if found else None
 
 
 def _ps_value(pid: int, field: str) -> str:

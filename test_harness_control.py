@@ -251,6 +251,49 @@ class HarnessControlTests(unittest.TestCase):
         self.assertFalse(payload["harness_running"])
         self.assertEqual(payload["run_dir"], str(run_dir))
 
+    def test_status_reports_structured_review_progress(self):
+        self.environment.enable_review_v2()
+        run_dir = self.environment.create_run("Report Review v2 evidence.")
+        review_dir = run_dir / "reviews" / "00"
+        review_dir.mkdir(parents=True)
+        (review_dir / "REVIEW_PLAN.json").write_text(
+            json.dumps(
+                {
+                    "requirements": [{"id": "REQ-REQUEST"}],
+                    "worker_claims": [{"id": "CLAIM-SUMMARY"}],
+                    "risks": [{"id": "RISK-001"}],
+                    "checks": [{"id": "CHK-001"}, {"id": "CHK-002"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (review_dir / "REVIEW_CHECKS.json").write_text(
+            json.dumps({"results": [{"status": "pass"}, {"status": "not_run"}]}),
+            encoding="utf-8",
+        )
+        (review_dir / "AUDIT.json").write_text(
+            json.dumps({"verdict": "INCONCLUSIVE"}), encoding="utf-8"
+        )
+        (review_dir / "FINAL_REVIEW.json").write_text(
+            json.dumps(
+                {
+                    "verdict": "INCONCLUSIVE",
+                    "reason_codes": ["BLOCKING_CHECK_UNAVAILABLE"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.object(harness_control, "current_run", return_value=run_dir), patch.object(
+            harness_control, "supervisor_pid", return_value=None
+        ):
+            payload = harness_control.status_payload()
+
+        self.assertEqual(payload["review_protocol_version"], 2)
+        self.assertEqual(payload["review_plan"], {"requirements": 1, "claims": 1, "risks": 1, "checks": 2})
+        self.assertEqual(payload["review_checks"], {"pass": 1, "fail": 0, "error": 0, "not_run": 1})
+        self.assertEqual(payload["reviewer_verdict"], "INCONCLUSIVE")
+        self.assertEqual(payload["final_review_reason_codes"], ["BLOCKING_CHECK_UNAVAILABLE"])
+
     def test_plain_status_output_supports_english_and_chinese(self):
         with patch.object(harness_control, "current_run", return_value=None):
             for language, expected in (("en", "Status: IDLE"), ("zh-CN", "状态：IDLE")):

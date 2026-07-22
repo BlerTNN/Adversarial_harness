@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-Start your preferred coding agent in this project directory and describe what you want in one prompt. The root agent plans and coordinates the task, an independent worker implements it in an isolated candidate, the Harness runs mandatory deterministic commands, and a separate reviewer audits that exact candidate together with the verification evidence. Only a passing candidate is promoted into the formal workspace. There is no command menu or task form to complete first.
+Start your preferred coding agent in this project directory and describe what you want in one prompt. The root agent coordinates the task, an independent worker implements it in an isolated candidate, and Review v2 turns the result into a structured plan, Harness-owned check evidence, an independent assessment, and a deterministic final verdict. Only a passing candidate is promoted into the formal workspace. There is no command menu or task form to complete first.
 
 For example:
 
@@ -31,8 +31,12 @@ one user request
   -> root TUI agent: understand, plan, coordinate, and report
   -> worker: implement in an isolated candidate workspace
   -> Harness: run configured deterministic verification commands
-  -> reviewer: independently check the same candidate and return PASS or FIX
+  -> review planner: map the request, Worker claims, and risks to checks
+  -> Harness: execute planned command checks and save bounded raw evidence
+  -> assessor: inspect the same artifact and return PASS/FIX/INCONCLUSIVE
+  -> Harness: apply fixed final-adjudication rules
       |-- FIX: the worker repairs the result, then review repeats
+      |-- INCONCLUSIVE: pause the same round until the environment recovers
       `-- PASS: promote the candidate, save the report, and wait
 ```
 
@@ -72,7 +76,7 @@ Every run has isolated state, logs, review history, and a final report. At creat
 
 The candidate deliberately excludes `.git` case-insensitively, Harness control paths, and run records. Git discovery is also capped at the candidate boundary so a child command cannot accidentally bind to an ancestor repository. Worker and verification commands therefore must not depend on repository metadata such as `git diff --check`; the formal workspace's `.git` remains untouched during promotion. Directory symlinks, Windows junctions, absolute symlinks, and relative symlinks that escape the workspace are rejected so omitted formal content cannot reappear through an alias after promotion. These measures protect normal operation; they are not an OS sandbox.
 
-Handoffs do not depend on a specific CLI's terminal format. The worker maintains `PLAN.md` and writes `WORKER_RESULT.json` after every attempt. The Harness records `VERIFICATION.json` plus `verification.log`, and the reviewer writes `AUDIT.json` in an isolated review directory. The Harness archives these structured files and uses them to decide PASS, FIX, promotion, and where a resumed run should continue.
+Handoffs do not depend on a specific CLI's terminal format. The worker maintains `PLAN.md` and writes `WORKER_RESULT.json` after every attempt. The Harness records `VERIFICATION.json`, then Review v2 produces `REVIEW_PLAN.json`, Harness-owned `REVIEW_CHECKS.json` and bounded stdout/stderr logs, the preserved assessor `AUDIT.json`, a manual-evidence manifest, and Harness-owned `FINAL_REVIEW.json`. Artifact, policy, plan, and evidence hashes are revalidated immediately before promotion.
 
 Only one active run is accepted at a time, including when callers choose different run directories:
 
@@ -127,7 +131,22 @@ The exact `{python}` argv token is resolved to the current `sys.executable` when
 ]
 ```
 
-Commands may create caches or build output because their workspace is discarded afterward. An executable with an explicit relative path, such as `./scripts/check` on POSIX or `.\check.cmd` on Windows, is resolved from that disposable workspace, not from the Harness source directory. A bare executable such as `npm` is always resolved through `PATH` on every platform; candidate files cannot shadow it. A failure is persisted under `iterations/NN/`, is injected into the review as a major issue, and forces FIX even if the reviewer returned PASS. The reviewer cannot waive this gate.
+Commands may create caches or build output because their workspace is discarded afterward. An executable with an explicit relative path, such as `./scripts/check` on POSIX or `.\check.cmd` on Windows, is resolved from that disposable workspace, not from the Harness source directory. A bare executable such as `npm` is always resolved through `PATH` on every platform; candidate files cannot shadow it. A failure is persisted under `iterations/NN/` and forces the Harness final verdict to FIX even if the assessor returned PASS. The assessor cannot waive this gate.
+
+Verification and planned review commands receive no interactive stdin and run with a minimal allowlisted environment: trusted `PATH`, required OS runtime variables, locale, UTF-8 settings, and fresh temporary HOME/TEMP directories. Agent CLI processes retain their login environment because they may need provider authentication. This reduces accidental credential exposure; it is not a filesystem or network sandbox.
+
+## Structured Review v2
+
+Every Review v2 run snapshots `review_protocol_version: 2`, the complete review policy, and its SHA-256 fingerprint. The same reviewer profile is invoked in two fresh sessions:
+
+1. `PLAN` preserves the complete request as `REQ-REQUEST`, copies every Harness-derived Worker claim, considers every configured risk category, and writes checks using one authoritative `checks[].covers` relationship.
+2. The Harness validates the plan, resolves `{python}`, and executes each command check in a new disposable artifact copy. Multiple steps inside one check share that check's copy; separate checks cannot contaminate one another. Stdout and stderr are separated, hashed, and truncated at the configured byte limit while the process output is still drained.
+3. `ASSESS` performs inspection or visual checks, saves cited evidence under `reviewer-evidence/`, and writes Audit v2. It cannot rewrite Harness command results.
+4. The Harness records manual-evidence hashes and generates `FINAL_REVIEW.json` using fixed rules. Confirmed defects and failed blocking checks produce FIX. Missing blocking evidence produces INCONCLUSIVE. Only complete passing evidence produces PASS.
+
+The Audit remains the reviewer's original conclusion; Review v2 never edits it to manufacture agreement. Promotion rereads and revalidates the plan, logs, result hashes, audit, manual evidence, deterministic verification, and final report, then independently recalculates the verdict. A forged `FINAL_REVIEW.json` therefore cannot open the gate.
+
+This release implements the reference design's minimum viable Review v2. A separate Challenger pass and seeded review benchmarks remain deliberate future work; no inactive Challenger schema or configuration is exposed yet. The current flow already closes promotion on incomplete evidence without paying for an additional Agent call on every successful review.
 
 ## Status, pause, and recovery
 
@@ -147,7 +166,9 @@ py -3 harness_control.py continue
 
 `stop` terminates the current managed child tree while preserving the candidate workspace, phase, and review records already written to disk. Its authoritative pause request lives in a Harness-owned runtime control directory outside the child-authorized run record, so a Worker cannot cancel it by deleting or replacing the visible compatibility marker. A crashed Windows Supervisor closes its Job handle, so managed descendants are terminated by the OS; POSIX recovery terminates the saved process group. For safety, Windows refuses PID-only termination of an unmanaged or legacy orphan and preserves its identity for manual diagnosis. `continue` refuses to create a duplicate while a recorded child is alive, then resumes the exact saved run after it is stopped. It cannot guarantee an additional session summary before termination. Never submit the old request with `start`, because that creates a duplicate task.
 
-Run format v2 introduced candidate isolation and promotion. Unfinished v1 runs created by an earlier version are intentionally rejected rather than resumed without those guarantees; finish or archive them with the earlier version before upgrading.
+`INCONCLUSIVE` leaves the same run and review round PAUSED. After the missing tool or environment becomes available, `continue` recreates the plan and evidence for the same artifact; it does not consume a repair round or promote an unverified result.
+
+Run format v2 introduced candidate isolation and promotion. Unfinished run-format v1 tasks created by an earlier version are intentionally rejected rather than resumed without those guarantees. Within safe run format v2, a run whose snapshotted config has no `review_protocol_version` continues with the former Audit v1 review flow; it is never silently upgraded mid-run. The shipped configuration creates new runs with Review v2.
 
 Plain CLI output follows `HARNESS_LANG` when set, then the system locale. Override it explicitly when needed:
 
@@ -165,7 +186,7 @@ For a read-only local dashboard, run `python3 status_dashboard.py` on macOS/Linu
 
 ## Platform parity and Windows notes
 
-The same run states, candidate isolation, verification gate, review loop, pause/resume behavior, promotion, rollback, and dashboard are used on all three operating-system families. POSIX hosts use `flock`, process sessions, creation-token checks, and process-group signals. Windows uses a one-byte `msvcrt` lock and WinAPI PID creation-time checks; every Worker, Reviewer, and verifier is created suspended, assigned to a kill-on-close Job Object, and only then allowed to execute. This contains descendants created through normal child-process inheritance and cleans them after normal completion, pause, timeout, or Supervisor failure without a PID-only `taskkill` race. It is not an OS sandbox, and a trusted profile must not use an external process broker that deliberately creates work outside the Job. CLI, redirected logs, Agent pipes, JSON, and Markdown use UTF-8 independently of the host locale. Run-relative evidence paths always use `/`, while absolute workspace paths keep the host's native format. CI executes the full suite on Ubuntu, macOS, and Windows with Python 3.10 and 3.13.
+The same run states, candidate isolation, verification, Review v2 plan/check/assessment/adjudication phases, pause/resume behavior, promotion, rollback, and dashboard are used on all three operating-system families. POSIX hosts use `flock`, process sessions, creation-token checks, and process-group signals. Windows uses a one-byte `msvcrt` lock and WinAPI PID creation-time checks; every Worker, Reviewer, verifier, and planned command check is created suspended, assigned to a kill-on-close Job Object, and only then allowed to execute. This contains descendants created through normal child-process inheritance and cleans them after normal completion, pause, timeout, or Supervisor failure without a PID-only `taskkill` race. It is not an OS sandbox, and a trusted profile must not use an external process broker that deliberately creates work outside the Job. CLI, redirected logs, Agent pipes, JSON, and Markdown use UTF-8 independently of the host locale. Run-relative evidence paths always use `/`, while absolute workspace paths keep the host's native format. CI executes the full suite on Ubuntu, macOS, and Windows with Python 3.10 and 3.13.
 
 Windows-specific boundaries are explicit: formal workspace roots and internal paths are checked lexically before resolution, NTFS junctions/reparse directories are rejected again on resume and promotion, and a drive or UNC share root cannot be selected. Read-only attributes are changed only after an operation actually fails for a read-only destination; a failed retry restores the original attribute. A short-lived sharing violation from a concurrent Dashboard/status reader is retried for a bounded interval without changing permissions. A persistent exclusive share lock makes promotion pause and attempt exact rollback; unchanged locked entries need no replacement, while any rollback also blocked by the lock leaves the candidate and backup intact for diagnosis. After the lock is released, `continue` resumes the same promotion. Creating ordinary symlinks may require Developer Mode or administrator rights. Very long prompts should use stdin or `{prompt_file}` with a native executable; batch-wrapper argv containing any runtime placeholder is rejected before a run is created. Windows file privacy follows the ACL inherited from the project directory rather than POSIX `0600`/`0700` mode bits; see [SECURITY.md](SECURITY.md).
 
@@ -173,11 +194,11 @@ Windows-specific boundaries are explicit: formal workspace roots and internal pa
 
 The worker implements only the current request in the run's isolated candidate workspace. The formal workspace is not its working directory. It inspects existing content, makes the smallest complete change, and runs checks appropriate to the task. On a FIX round, the same worker profile resumes from the persisted candidate, plan, result, and full audit, resolving every blocker, major, and minor issue. Minor issues alone do not trigger another repair round.
 
-The reviewer runs in an independent session against another disposable copy of the candidate that was checked by the Harness. Review caches, builds, and accidental edits therefore cannot change either the candidate or formal delivery. The Harness binds verification and review evidence to the same SHA-256 artifact ID, checks that the formal workspace still matches its starting fingerprint, and promotes only after both gates pass. A failed check or any blocker/major finding prevents PASS. Minor findings may be reported without blocking PASS when the reviewer itself returns PASS. The Harness never rewrites an explicit FIX into PASS. The default review limit is three rounds.
+The reviewer profile runs separate planner and assessor sessions against disposable copies. The planner cannot omit the full request or any Worker claim supplied by the Harness. The assessor cannot replace Harness-owned command evidence and must cite persistent evidence for every passing manual check. Review caches, builds, and accidental edits cannot change the candidate or formal delivery. A confirmed blocker/major or failed blocking check forces FIX; unavailable blocking evidence forces INCONCLUSIVE; minor findings alone may still pass. The Harness never rewrites an explicit FIX into PASS. The default repair-review limit is three rounds, while INCONCLUSIVE retries do not consume a round.
 
 The snapshot and integrity checks are not an operating-system sandbox. Built-in profiles still run with the current user's permissions and can access other local paths or the network. Use only trusted local agent profiles and trusted requests. See [SECURITY.md](SECURITY.md) for the complete trust model.
 
-The complete role prompts are [worker.md](prompts/worker.md) and [reviewer.md](prompts/reviewer.md).
+The complete role prompts are [worker.md](prompts/worker.md), [review_planner.md](prompts/review_planner.md), and [reviewer_v2.md](prompts/reviewer_v2.md). [reviewer.md](prompts/reviewer.md) remains only for safe unfinished runs using Review v1.
 
 ## Configuration summary
 
@@ -193,6 +214,12 @@ Important fields in [harness.config.json](harness.config.json):
 | `timeout_seconds` | `5400` | Timeout for one agent invocation |
 | `verification_commands` | `{python} -m compileall -q .` | Mandatory ordered argv commands; all must exit 0; `{python}` snapshots the current interpreter |
 | `verification_timeout_seconds` | `600` | Timeout for each deterministic command |
+| `review_protocol_version` | `2` | Structured plan, Harness evidence, Audit v2, and final adjudication |
+| `review_policy.max_dynamic_checks` | `12` | Maximum planned checks in one round |
+| `review_policy.max_steps_per_check` | `4` | Maximum argv steps sharing one check copy |
+| `review_policy.per_check_timeout_seconds` | `600` | Planner ceiling for one command check |
+| `review_policy.total_check_timeout_seconds` | `1800` | Total command-check budget per review round |
+| `review_policy.max_log_bytes_per_step` | `10485760` | Stored bytes per stdout or stderr stream; excess is drained but not stored |
 
 The configuration does not store credentials. Each agent CLI manages its own authentication. Never place tokens, `.env` contents, or authorization headers in a request, prompt, log, or profile argv. Run records and raw CLI output are private local evidence files and may still contain task content.
 
