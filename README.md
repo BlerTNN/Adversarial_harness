@@ -1,18 +1,18 @@
-# 一句话多 Agent Harness
+# One-Prompt Multi-Agent Harness
 
-[中文](README.md) | [English](README.en.md)
+[English](README.md) | [中文](README.zh-CN.md)
 
-在这个项目目录里直接启动你习惯的 coding agent，然后说一句要做什么。根 Agent 会规划任务，调用一个独立 worker 完成工作，再调用另一个独立 reviewer 审查；不需要先进入命令菜单、填写任务文件或逐步确认。
+Start your preferred coding agent in this project directory and describe what you want in one prompt. The root agent plans and coordinates the task, an independent worker implements it, and a separate reviewer audits the result. There is no command menu or task form to complete first.
 
-例如：
+For example:
 
-> 给我做一个好看的电商网站，支持手机端，商品和购物车流程要完整。
+> Build a polished ecommerce website with a complete responsive storefront and cart flow.
 
-一次任务完成后继续说下一句话即可。workspace 会保留，新的任务会创建新的 run，根 TUI 不需要重启。
+After one task finishes, simply describe the next one. The workspace persists, each request creates a new run, and the root TUI does not need to restart.
 
-## 直接开始
+## Quick start
 
-进入项目目录，启动任意一个已安装并登录的 CLI：
+From this directory, start any installed and authenticated CLI:
 
 ```bash
 hermes chat --tui
@@ -22,85 +22,85 @@ copilot
 claude
 ```
 
-只运行其中一个。它就是当前根 TUI Agent，并应遵循双语的 [AGENTS.md](AGENTS.md)。如果某个 CLI 不会自动读取项目说明，可以先让它读取该文件。
+Run only one. It becomes the root TUI agent and should follow the bilingual [AGENTS.md](AGENTS.md). If a CLI does not load repository instructions automatically, ask it to read that file first.
 
-随后直接用中文或英文说需求。需求文件、Prompt、状态和结构化交接产物都使用 UTF-8；Worker 和 Reviewer 会按权威需求的语言编写面向用户的内容。典型流程是：
+Then describe the task in English or Chinese. Requests, prompts, state, and structured handoffs are UTF-8, and workers and reviewers use the authoritative request's language for user-facing content.
 
 ```text
-用户的一句话
-  → 根 TUI Agent：理解、规划、调度和汇报
-  → Worker：在持久 workspace 中实施并验证
-  → Reviewer：独立检查，返回 PASS 或 FIX
-      ├─ FIX：原 Worker 修复，再次审查
-      └─ PASS：保存报告，等待下一句话
+one user request
+  -> root TUI agent: understand, plan, coordinate, and report
+  -> worker: implement and verify in the persistent workspace
+  -> reviewer: independently check and return PASS or FIX
+      |-- FIX: the worker repairs the result, then review repeats
+      `-- PASS: save the report and wait for the next request
 ```
 
-默认 worker 和 reviewer 都使用与根 TUI 相同的 Agent profile，但它们是彼此独立的会话。例如，从 Hermes 启动时默认是 Hermes 协调、Hermes 实施、另一个 Hermes 审查。也可以在需求中明确指定“Cursor 做，Copilot 审查”。
+By default, the worker and reviewer inherit the root TUI's agent profile, but they run in separate sessions. For example, starting from Hermes produces one Hermes coordinator, one Hermes worker, and another independent Hermes reviewer. You may also explicitly request different profiles, such as “Cursor implements; Copilot reviews.”
 
-## 第一次使用
+## Requirements
 
-需要：
+You need:
 
-- Python 3；
-- 至少一个已安装、已登录的 coding-agent CLI；
-- 一个你信任的本地目录，因为内置 worker profile 采用无人值守权限完成任务。
+- Python 3;
+- at least one installed and authenticated coding-agent CLI;
+- a trusted local directory, because the built-in worker profiles run unattended.
 
-确认目标 CLI 可用即可，不需要安装全部 Agent：
+Only the CLI you plan to use must be installed:
 
 ```bash
 python3 --version
-hermes --version       # 或 codex / cursor-agent / copilot / claude
+hermes --version       # or codex / cursor-agent / copilot / claude
 ```
 
-项目本身只使用 Python 标准库。默认配置见 [harness.config.json](harness.config.json)。
+The Harness itself uses only the Python standard library. See [harness.config.json](harness.config.json) for the default configuration.
 
-默认 `workspace/` 会把任务产物与 Harness 自身隔开。若把 Harness 放进已有代码仓库并希望 worker 直接修改该仓库，可把配置中的 `workspace` 改成 `.` 或目标目录；不要让不受信任的 profile 操作包含敏感数据的目录。
+The default `workspace/` keeps task output separate from Harness source. To have workers modify an existing repository directly, set `workspace` to `.` or to that repository in the configuration. Do not allow an untrusted profile to operate on a directory containing sensitive data.
 
-## 一句话如何变成任务
+## From one request to a run
 
-根 Agent 会先读取当前状态。没有未结束任务时，它会把你的原始目标、约束和必要假设整理到 `.harness-request.md`，再交给控制器。明确的需求不会被追问成一张表；只有缺失信息会实质改变结果时才需要一个简短问题。
+The root agent checks the current state first. When no unfinished run exists, it records the original goal, constraints, and necessary assumptions in `.harness-request.md`, then submits that file to the controller. Clear requests are not turned into a questionnaire; the agent asks one short question only when missing information would materially change the result.
 
-每个 run 都有独立状态、日志、审查历史和最终报告。实现结果保存在配置指定的持久 `workspace/` 中，因此后续任务可以继续改进前一项成果。运行记录保存在 `runs/`，不会覆盖以前的任务。
+Every run has isolated state, logs, review history, and a final report. Delivered files remain in the configured persistent `workspace/`, so later tasks can improve earlier work. Run records live under `runs/` and never overwrite previous tasks.
 
-跨 CLI 的交接不依赖终端输出格式。Worker 持续更新 run 中的 `PLAN.md`，并在每轮结束写 `WORKER_RESULT.json`；Reviewer 在独立 review 目录写 `AUDIT.json`。Harness 会归档每轮结果并以这些结构化文件决定 PASS、FIX 和恢复位置。
+Handoffs do not depend on a specific CLI's terminal format. The worker maintains `PLAN.md` and writes `WORKER_RESULT.json` after every attempt. The reviewer writes `AUDIT.json` in an isolated review directory. The Harness archives these structured files and uses them to decide PASS, FIX, and where a resumed run should continue.
 
-Harness 同一时间只认领一个活动 run：
+Only one active run is accepted at a time:
 
-- 活动任务存在时，重复提交会被拒绝；
-- COMPLETE 或 INCOMPLETE 后可以立即提交下一句话；
-- TUI 或进程意外退出时，恢复原 run，不会重新执行旧需求。
+- a duplicate submission is rejected while an unfinished run exists;
+- a new request can start immediately after COMPLETE or INCOMPLETE;
+- after a TUI or process interruption, resume the original run instead of resubmitting its request.
 
-`start` 自身会 detach，因此不依赖某一家 TUI 的后台工具语义。支持后台完成通知的根 Agent 可以另外运行 `./harness_control.py wait`；其他 TUI 仍可随时用 `status` 查询，任务不会因为对话继续而停止。
+`start` detaches by itself and does not depend on background-task behavior from a particular TUI. A root agent with completion notifications may also run `./harness_control.py wait`; all other TUIs can query `status` at any time.
 
-## Agent 选择
+## Agent selection
 
-内置 profile：
+Built-in profiles:
 
-| Profile | 交互式入口 | 说明 |
+| Profile | Interactive entry point | Description |
 | --- | --- | --- |
-| `hermes` | `hermes chat --tui` | 默认 fallback；不固定 provider 或 model |
-| `codex` | `codex` | 非交互调用从 stdin 接收 Prompt |
+| `hermes` | `hermes chat --tui` | Default fallback; does not pin a provider or model |
+| `codex` | `codex` | Receives its non-interactive prompt through stdin |
 | `cursor` | `cursor-agent` | Cursor Agent CLI |
 | `copilot` | `copilot` | GitHub Copilot CLI |
 | `claude` | `claude` | Claude Code |
 
-Harness 优先识别当前根 TUI Agent；无法识别时才使用 `default_agent`。`worker_agent` 和 `reviewer_agent` 为 `null` 时继承根 Agent，设置为 profile 名则分别覆盖。选择会写入 run 配置，恢复时继续使用原选择。
+The Harness first detects the current root TUI profile and uses `default_agent` only as a fallback. When `worker_agent` and `reviewer_agent` are `null`, both inherit the root profile. Explicit profile choices are persisted with the run and reused after recovery.
 
-可先运行 `./harness_control.py agents` 查看识别结果。状态中的 `coordinator_detection` 会明确记录它来自启动环境、祖先进程、显式参数还是 fallback；包装器无法识别时可在 `start` 追加 `--coordinator-agent <profile>`。
+Run `./harness_control.py agents` to inspect detection and availability. The `coordinator_detection` field records whether the choice came from the launch environment, an ancestor process, an explicit option, or fallback. When a wrapper cannot be detected, add `--coordinator-agent <profile>` to `start`.
 
-一个 profile 只需要四项：描述、进程检测特征、TUI argv 和非交互 command argv；需要 stdin 的 CLI 可以额外提供 `stdin`。command 和 stdin 可使用：
+A profile needs a description, process-detection patterns, interactive TUI argv, and non-interactive command argv. CLIs that read stdin may also define `stdin`. Command and stdin templates support:
 
-- `{prompt}`：本轮完整 Prompt；
-- `{prompt_file}`：保存 Prompt 的文件；
-- `{workspace}`：任务工作目录；
-- `{run_dir}`：当前 run 目录；
-- `{role}`：`worker` 或 `reviewer`。
+- `{prompt}`: the rendered prompt for this attempt;
+- `{prompt_file}`: the saved prompt path;
+- `{workspace}`: the task workspace;
+- `{run_dir}`: the current run record;
+- `{role}`: `worker` or `reviewer`.
 
-新增或调整 CLI 通常只需修改 [harness.config.json](harness.config.json)，不需要复制一套 Harness。CLI 必须支持在指定目录非交互完成一轮工作；只有 GUI、无法接收 Prompt 的工具不能直接作为 worker/reviewer profile。
+Adding or adjusting a CLI normally requires only [harness.config.json](harness.config.json). The CLI must be able to complete one non-interactive turn in a specified directory; GUI-only tools that cannot accept a prompt cannot be worker or reviewer profiles.
 
-## 暂停、恢复与状态
+## Status, pause, and recovery
 
-在根 TUI 中直接说“状态/status”“停止/stop”或“继续/continue”即可。对应的只读/控制命令是：
+In the root TUI, say “status”, “stop”/“pause”, or “continue”/“resume”. Chinese equivalents work as well. The corresponding commands are:
 
 ```bash
 ./harness_control.py status --json
@@ -108,48 +108,48 @@ Harness 优先识别当前根 TUI Agent；无法识别时才使用 `default_agen
 ./harness_control.py continue
 ```
 
-`stop` 会终止当前子 Agent，并保留已经写入磁盘的 workspace、阶段和审查记录；它不能保证 Agent 在被终止前额外输出一份会话总结。`continue` 只恢复同一个 run，并从这些持久文件重新启动对应 profile。不要用旧需求再次执行 `start`，否则会产生重复任务。
+`stop` terminates the current child agent while preserving the workspace, phase, and review records already written to disk. It cannot guarantee an additional session summary before termination. `continue` resumes that exact run and restarts the appropriate saved profile. Never submit the old request with `start`, because that creates a duplicate task.
 
-如需本机浏览器中的只读状态页，可运行 `python3 status_dashboard.py`，再打开终端显示的地址。页面可在中文和 English 之间切换；它不是完成任务所必需的，也不提供修改或控制按钮。
-
-CLI 文本会根据 `HARNESS_LANG` 或系统 locale 选择中文或英文。需要显式覆盖时：
+Plain CLI output follows `HARNESS_LANG` when set, then the system locale. Override it explicitly when needed:
 
 ```bash
-HARNESS_LANG=zh-CN ./harness_control.py status
 HARNESS_LANG=en ./harness_control.py status
+HARNESS_LANG=zh-CN ./harness_control.py status
 ```
 
-## Worker 与 Reviewer
+For a read-only local dashboard, run `python3 status_dashboard.py` and open the address printed in the terminal. The page can switch between English and Chinese. It is optional and has no control buttons.
 
-Worker 只在 workspace 中实施当前需求，先检查已有内容，再做最小完整改动并运行与任务匹配的验证。收到 FIX 后继续使用同一 worker profile，并从持久计划、结果和完整审计文件恢复上下文；该修复轮会同时处理审计中的全部 blocker、major 和 minor，并逐项验证可执行的验收检查。minor 单独存在时仍不会触发修复轮。
+## Worker and reviewer rules
 
-Reviewer 使用独立会话，只读检查需求、产物和 worker 的验证结果。它应实际运行适合该任务的非破坏性检查，但不会把网站任务强制套成浏览器游戏测试，也不会把普通脚本任务强制套成 UI 审查。只有 blocker/major 问题触发 FIX；minor 会进入报告但不阻止 PASS。默认最多审查三轮。
+The worker implements only the current request in the workspace. It inspects existing content, makes the smallest complete change, and runs checks appropriate to the task. On a FIX round, the same worker profile resumes from the persisted plan, result, and full audit, resolving every blocker, major, and minor issue. Minor issues alone do not trigger another repair round.
 
-这里的“只读”是 Harness 会检测并拒绝 reviewer 对 workspace 的净修改，不是操作系统级安全沙箱；profile 仍应只使用你信任的本地 Agent 和权限。Reviewer 运行会生成缓存或构建文件的检查时，应把输出放到 review 目录或临时目录，结束前保持 workspace 与审查前一致。
+The reviewer runs in an independent session and treats the workspace as read-only. It inspects the request, delivered files, and worker report, and performs suitable non-destructive checks. It does not force UI checks onto a script or game-specific checks onto an unrelated website. Only blocker and major findings trigger FIX; minor findings are reported without blocking PASS. The default review limit is three rounds.
 
-两个角色的完整约束分别在 [worker.md](prompts/worker.md) 和 [reviewer.md](prompts/reviewer.md)。
+“Read-only” means the Harness detects and rejects net reviewer changes to the workspace; it is not an operating-system sandbox. Use only trusted local agent profiles. Review checks that create caches or build files should redirect them to the review directory or a temporary directory and leave the workspace unchanged.
 
-## 配置摘要
+The complete role prompts are [worker.md](prompts/worker.md) and [reviewer.md](prompts/reviewer.md).
 
-[harness.config.json](harness.config.json) 的主要字段：
+## Configuration summary
 
-| 字段 | 默认值 | 含义 |
+Important fields in [harness.config.json](harness.config.json):
+
+| Field | Default | Meaning |
 | --- | --- | --- |
-| `workspace` | `workspace` | 跨 run 保留的实现目录 |
-| `default_agent` | `hermes` | 无法识别根 Agent 时的 fallback |
-| `worker_agent` | `null` | `null` 表示继承根 Agent |
-| `reviewer_agent` | `null` | `null` 表示继承根 Agent |
-| `max_reviews` | `3` | FIX/复审上限 |
-| `timeout_seconds` | `5400` | 单次 Agent 调用超时 |
+| `workspace` | `workspace` | Persistent implementation directory across runs |
+| `default_agent` | `hermes` | Fallback when the root agent cannot be detected |
+| `worker_agent` | `null` | `null` inherits the root profile |
+| `reviewer_agent` | `null` | `null` inherits the root profile |
+| `max_reviews` | `3` | Maximum FIX/review rounds |
+| `timeout_seconds` | `5400` | Timeout for one agent invocation |
 
-配置不存放密钥。凭据仍由各 Agent CLI 自己管理；不要把 token、`.env` 内容或授权头写进需求、Prompt、日志或 profile argv。
+The configuration does not store credentials. Each agent CLI manages its own authentication. Never place tokens, `.env` contents, or authorization headers in a request, prompt, log, or profile argv.
 
-## 开发与验证
+## Development and verification
 
-修改 Harness 本身时应在当前 coding-agent 会话中直接完成，绝不能为了修改 Harness 而启动 Harness。基础检查：
+When changing the Harness itself, work directly in the current coding-agent session. Never start a Harness run to modify the Harness.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v
 ```
 
-Prompt 变量说明见 [prompts/README.md](prompts/README.md)。
+Prompt variables and structured artifact schemas are documented in [prompts/README.en.md](prompts/README.en.md).
