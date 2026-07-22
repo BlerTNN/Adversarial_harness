@@ -13,7 +13,7 @@ class StatusDashboardTests(unittest.TestCase):
         run = root / "runs" / name
         run.mkdir(parents=True)
         state = {
-            "schema_version": "generic-harness/v1",
+            "schema_version": "generic-harness/v2",
             "run_id": name,
             "status": "RUNNING",
             "phase": "build",
@@ -63,6 +63,7 @@ class StatusDashboardTests(unittest.TestCase):
             worker = new / "iterations" / "00"
             worker.mkdir(parents=True)
             (worker / "worker.log").write_text("worker output\n", encoding="utf-8")
+            (worker / "verification.log").write_text("verification output\n", encoding="utf-8")
             reviewer = new / "reviews" / "00"
             reviewer.mkdir(parents=True)
             (reviewer / "reviewer.log").write_text("review output\n", encoding="utf-8")
@@ -81,6 +82,7 @@ class StatusDashboardTests(unittest.TestCase):
                     "harness.log",
                     "events.jsonl",
                     "iterations/00/worker.log",
+                    "iterations/00/verification.log",
                     "reviews/00/reviewer.log",
                 },
             )
