@@ -645,6 +645,8 @@ def terminate_managed_process(process: subprocess.Popen[str], grace: float = 5.0
     except ProcessLookupError:
         return
     except PermissionError as error:
+        if process.poll() is not None and not _posix_group_has_live_members(process_group):
+            return
         raise RuntimeError(f"Could not terminate process group {process_group}") from error
     deadline = time.monotonic() + grace
     if root_alive:
@@ -664,6 +666,8 @@ def terminate_managed_process(process: subprocess.Popen[str], grace: float = 5.0
         except ProcessLookupError:
             pass
         except PermissionError as error:
+            if process.poll() is not None and not _posix_group_has_live_members(process_group):
+                return
             raise RuntimeError(f"Could not kill process group {process_group}") from error
         kill_deadline = time.monotonic() + max(1.0, grace)
         identity = process_group_identity_status(process_group, started)

@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import harness
 import platform_support
@@ -381,6 +381,49 @@ class PlatformSupportTests(unittest.TestCase):
             return_value=True,
         ):
             self.assertTrue(platform_support.process_group_matches(42, "saved-token"))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group behavior")
+    def test_posix_permission_error_is_benign_after_the_managed_group_exits(self):
+        process = Mock(pid=43210)
+        process._harness_started = "saved-token"
+        process.poll.side_effect = [None, 0]
+        with patch.object(
+            platform_support,
+            "process_group_identity_status",
+            return_value="match",
+        ), patch.object(
+            platform_support,
+            "_posix_group_has_live_members",
+            return_value=False,
+        ), patch.object(
+            platform_support.os,
+            "killpg",
+            side_effect=PermissionError,
+        ):
+            platform_support.terminate_managed_process(process)
+
+        process.poll.assert_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group behavior")
+    def test_posix_permission_error_still_fails_closed_for_a_live_group(self):
+        process = Mock(pid=43210)
+        process._harness_started = "saved-token"
+        process.poll.side_effect = [None, 0]
+        with patch.object(
+            platform_support,
+            "process_group_identity_status",
+            return_value="match",
+        ), patch.object(
+            platform_support,
+            "_posix_group_has_live_members",
+            return_value=True,
+        ), patch.object(
+            platform_support.os,
+            "killpg",
+            side_effect=PermissionError,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Could not terminate process group"):
+                platform_support.terminate_managed_process(process)
 
     @unittest.skipIf(os.name == "nt", "POSIX identity behavior")
     def test_posix_managed_spawn_reaps_a_child_when_identity_cannot_be_read(self):
