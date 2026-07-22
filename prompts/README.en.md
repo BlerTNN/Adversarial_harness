@@ -23,10 +23,11 @@ are independent of CLI profiles; commands are defined in
 `reviewer.md`:
 
 - `{request}`: the same authoritative request;
-- `{workspace}`: the implementation directory, which must remain unchanged;
+- `{workspace}`: an isolated snapshot of the delivered implementation;
 - `{run_dir}`: the current run record;
 - `{worker_report}`: the worker's reported changes and checks;
-- `{review_dir}`: the reviewer's only writable evidence directory.
+- `{review_dir}`: the reviewer's only persistent evidence directory;
+- `{artifact_id}`: the SHA-256 identity of the live delivery being reviewed.
 
 Preserve variable spelling. Use `{{` and `}}` for literal braces in template
 text. Do not hard-code an agent, vendor, model, local path, or task-specific
@@ -41,6 +42,7 @@ under the matching iteration. The result must contain:
 
 ```json
 {
+  "schema_version": "generic-harness/worker-result/v1",
   "status": "complete",
   "summary": "What was delivered.",
   "changed_files": ["relative/path"],
@@ -63,6 +65,7 @@ The reviewer writes its structured result to `{review_dir}/AUDIT.json`:
 
 ```json
 {
+  "schema_version": "generic-harness/audit/v1",
   "verdict": "PASS",
   "summary": "Independent review summary.",
   "checks": [
@@ -88,4 +91,5 @@ The reviewer writes its structured result to `{review_dir}/AUDIT.json`:
 ```
 
 `verdict` must be `PASS` or `FIX`; `severity` must be `blocker`, `major`, or
-`minor`. Every field is required, including empty arrays.
+`minor`. Every field is required, including empty arrays. The Harness records
+the reviewed artifact ID in the accepted audit and final report.

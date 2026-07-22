@@ -9,8 +9,11 @@ Authoritative user request:
 {request}
 ---
 
-Read-only workspace under review:
+Isolated workspace snapshot under review:
 {workspace}
+
+Authoritative delivered-artifact SHA-256:
+{artifact_id}
 
 Run record:
 {run_dir}
@@ -40,15 +43,16 @@ Follow the authoritative request's language for summaries and user-facing
 findings unless the request specifies another language. Keep required JSON keys
 and enum values exactly as defined below.
 
-Keep the workspace unchanged. Write only fresh evidence under the authorized
-review directory. Put caches, build output, and other temporary check artifacts
-outside the workspace, or remove them before finishing; any net workspace change
-invalidates the review. If resumed with “继续” or “continue”, continue this same
-review and role.
+The supplied workspace is a disposable snapshot; it is not the worker's live
+delivery. Write lasting evidence only under the authorized review directory.
+Caches and build output may be created inside the snapshot and are discarded
+after review. Never locate or modify the live workspace or Harness control
+files. If resumed with “继续” or “continue”, continue this same review and role.
 
 Before finishing, write valid UTF-8 JSON to `{review_dir}/AUDIT.json` with all of
 these fields:
 
+- `schema_version`: exactly `generic-harness/audit/v1`;
 - `verdict`: `PASS` or `FIX`;
 - `summary`: concise independent conclusion;
 - `checks`: array of objects with `name`, `command`, `status`, and `details`;
@@ -59,8 +63,9 @@ these fields:
 
 All fields must exist even when arrays are empty. Do not put Markdown fences
 around the JSON and do not include secrets. PASS may include minor issues, but
-FIX must identify every blocker or major issue. If required verification cannot
-be performed, record the exact limitation and do not invent a PASS.
+FIX must identify every blocker or major issue. A failed check is incompatible
+with PASS. If required verification cannot be performed, record the exact
+limitation and do not invent a PASS.
 
 Finish with an explicit `Verdict: PASS` or `Verdict: FIX`, followed by the checks
 performed and concise findings.

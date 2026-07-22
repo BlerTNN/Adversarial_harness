@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import stat
 import string
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -30,8 +33,33 @@ RUNS_DIR = ROOT / "runs"
 CONFIG_PATH = ROOT / "harness.config.json"
 PROMPTS_DIR = ROOT / "prompts"
 STATE_SCHEMA = "generic-harness/v1"
+WORKER_RESULT_SCHEMA = "generic-harness/worker-result/v1"
+AUDIT_SCHEMA = "generic-harness/audit/v1"
+ARTIFACT_SCHEMA = "generic-harness/artifact/v1"
 TERMINAL_STATUSES = {"COMPLETE", "INCOMPLETE"}
 PAUSE_FILE = ".operator-paused"
+MAX_HANDOFF_BYTES = 1_000_000
+MAX_ARG_PROMPT_BYTES = 100_000
+PROTECTED_STATE_FIELDS = (
+    "schema_version",
+    "run_id",
+    "request",
+    "workspace",
+    "coordinator_agent",
+    "coordinator_detection",
+    "worker_agent",
+    "reviewer_agent",
+    "review_index",
+    "max_reviews",
+    "phase",
+    "status",
+    "artifact_id",
+    "artifact_path",
+    "last_error",
+    "created_at",
+    "started_at",
+    "finished_at",
+)
 
 
 class HarnessError(RuntimeError):
@@ -54,6 +82,7 @@ def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     temporary.write_text(content, encoding="utf-8")
+    temporary.chmod(0o600)
     temporary.replace(path)
 
 
@@ -71,6 +100,15 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def read_handoff(path: Path) -> dict[str, Any]:
+    try:
+        if path.stat().st_size > MAX_HANDOFF_BYTES:
+            raise HarnessError(f"Structured handoff exceeds {MAX_HANDOFF_BYTES} bytes: {path}")
+    except OSError as error:
+        raise HarnessError(f"Invalid JSON: {path}: {error}") from error
+    return read_json(path)
+
+
 def append_event(run_dir: Path, event: str, **details: Any) -> None:
     path = run_dir / "events.jsonl"
     lock_path = run_dir / "events.lock"
@@ -79,6 +117,77 @@ def append_event(run_dir: Path, event: str, **details: Any) -> None:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         with path.open("a", encoding="utf-8") as output:
             output.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        path.chmod(0o600)
+
+
+def pid_start_time(pid: int) -> str:
+    try:
+        return subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def pid_status(pid: int) -> str:
+    try:
+        return subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def process_matches(pid: int, started: str = "") -> bool:
+    if pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    status = pid_status(pid)
+    if not status or status.startswith("Z"):
+        return False
+    current = pid_start_time(pid)
+    return not started or not current or current == started
+
+
+def active_agent_pid(state: dict[str, Any]) -> int | None:
+    active = state.get("active_agent")
+    if not isinstance(active, dict):
+        return None
+    try:
+        pid = int(active.get("pid", 0))
+    except (TypeError, ValueError):
+        return None
+    return pid if process_matches(pid, str(active.get("pid_started", ""))) else None
+
+
+def terminate_process_group(pid: int, started: str = "", grace: float = 5.0) -> None:
+    if not process_matches(pid, started):
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace
+    while process_matches(pid, started) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if process_matches(pid, started):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -215,7 +324,7 @@ def _new_run_dir(runs_dir: Path) -> Path:
     candidate = runs_dir / stem
     if candidate.exists():
         candidate = runs_dir / f"{stem}-{uuid.uuid4().hex[:6]}"
-    candidate.mkdir()
+    candidate.mkdir(mode=0o700)
     return candidate.resolve()
 
 
@@ -250,13 +359,18 @@ def create_run(
     if not workspace_path.is_absolute():
         workspace_path = config_path.parent / workspace_path
     workspace_path = workspace_path.resolve()
+    if workspace_path in {Path("/"), Path.home().resolve()}:
+        raise HarnessError(f"Refusing a workspace that is too broad: {workspace_path}")
     workspace_path.mkdir(parents=True, exist_ok=True)
 
     selected_profiles = {name: config["agents"][name] for name in {worker, reviewer}}
     for name, profile in selected_profiles.items():
         _resolve_executable(profile["command"], name)
 
-    run_dir = _new_run_dir(runs_dir.expanduser().resolve())
+    runs_path = runs_dir.expanduser().resolve()
+    if runs_path == workspace_path:
+        raise HarnessError("runs_dir cannot be the workspace itself")
+    run_dir = _new_run_dir(runs_path)
     timeout = int(config.get("timeout_seconds", 5400))
     run_config = {
         "schema_version": STATE_SCHEMA,
@@ -284,6 +398,8 @@ def create_run(
         "review_index": 0,
         "max_reviews": reviews,
         "active_agent": None,
+        "artifact_id": None,
+        "artifact_path": None,
         "last_error": "",
         "created_at": now(),
         "updated_at": now(),
@@ -347,6 +463,47 @@ def _terminate(process: subprocess.Popen[str], grace: float = 5.0) -> None:
         process.wait()
 
 
+def _control_guard(run_dir: Path, protected_files: tuple[Path, ...] = ()) -> dict[str, Any]:
+    state = read_json(run_dir / "state.json")
+    return {
+        "config": read_json(run_dir / "run-config.json"),
+        "state": {field: state.get(field) for field in PROTECTED_STATE_FIELDS},
+        "files": {str(path): path.read_bytes() for path in protected_files},
+    }
+
+
+def _verify_control_guard(run_dir: Path, guard: dict[str, Any]) -> None:
+    changed: list[str] = []
+    config_path = run_dir / "run-config.json"
+    if read_json(config_path) != guard["config"]:
+        write_json(config_path, guard["config"])
+        changed.append("run-config.json")
+
+    state_path = run_dir / "state.json"
+    state = read_json(state_path)
+    for field, expected in guard["state"].items():
+        if state.get(field) != expected:
+            state[field] = expected
+            changed.append(f"state.json:{field}")
+    state["active_agent"] = None
+    if changed:
+        write_json(state_path, state)
+
+    for raw_path, expected in guard["files"].items():
+        path = Path(raw_path)
+        try:
+            actual = path.read_bytes()
+        except OSError:
+            actual = b""
+        if actual != expected:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(expected)
+            path.chmod(0o600)
+            changed.append(str(path.relative_to(run_dir)))
+    if changed:
+        raise HarnessError("Agent modified protected Harness control data: " + ", ".join(changed))
+
+
 def run_agent(
     *,
     run_dir: Path,
@@ -357,8 +514,9 @@ def run_agent(
     prompt_path: Path,
     log_path: Path,
     timeout_seconds: int,
+    workspace: Path | None = None,
 ) -> None:
-    workspace = Path(read_json(run_dir / "run-config.json")["workspace"])
+    workspace = workspace or Path(read_json(run_dir / "run-config.json")["workspace"])
     atomic_write(prompt_path, prompt + "\n")
     values = _FormatValues(
         prompt=prompt,
@@ -368,6 +526,10 @@ def run_agent(
         role=role,
     )
     try:
+        if any("{prompt}" in item for item in profile["command"]) and len(prompt.encode()) > MAX_ARG_PROMPT_BYTES:
+            raise HarnessError(
+                f"Prompt is too large for argv ({len(prompt.encode())} bytes); use stdin or {{prompt_file}} for {profile_name}"
+            )
         command = [item.format_map(values) for item in profile["command"]]
         stdin_text = profile.get("stdin")
         stdin_value = stdin_text.format_map(values) if isinstance(stdin_text, str) else None
@@ -376,8 +538,9 @@ def run_agent(
     command[0] = _resolve_executable(command, profile_name)
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    shown = ["<prompt>" if item == prompt else item for item in command]
+    shown = [item.replace(prompt, "<prompt>") if prompt else item for item in command]
     with log_path.open("a", encoding="utf-8") as log:
+        log_path.chmod(0o600)
         log.write(f"\n[{now()}] {role} via {profile_name}\n$ {shlex.join(shown)}\n")
         log.flush()
         try:
@@ -405,12 +568,16 @@ def run_agent(
                 "profile": profile_name,
                 "role": role,
                 "pid": process.pid,
+                "process_group": process.pid,
+                "pid_started": pid_start_time(process.pid),
                 "log": str(log_path.relative_to(run_dir)),
                 "started_at": now(),
             },
         )
         append_event(run_dir, "agent_started", profile=profile_name, role=role, pid=process.pid)
-        deadline = time.monotonic() + int(profile.get("timeout_seconds", timeout_seconds))
+        effective_timeout = int(profile.get("timeout_seconds", timeout_seconds))
+        deadline = time.monotonic() + effective_timeout
+        started_monotonic = time.monotonic()
         paused = False
         timed_out = False
         while process.poll() is None:
@@ -434,11 +601,12 @@ def run_agent(
         returncode=returncode,
         timed_out=timed_out,
         paused=paused,
+        duration_seconds=round(time.monotonic() - started_monotonic, 3),
     )
     if paused:
         raise OperatorPause("The active agent was stopped at the user's request.")
     if timed_out:
-        raise HarnessError(f"{profile_name} timed out after {timeout_seconds} seconds; see {log_path}")
+        raise HarnessError(f"{profile_name} timed out after {effective_timeout} seconds; see {log_path}")
     if returncode:
         raise HarnessError(f"{profile_name} exited {returncode}; see {log_path}")
 
@@ -448,7 +616,9 @@ def _worker_result(run_dir: Path, index: int) -> tuple[Path, dict[str, Any]]:
     result_path = run_dir / "iterations" / f"{index:02d}" / "WORKER_RESULT.json"
     if not plan.is_file() or not plan.read_text(encoding="utf-8").strip():
         raise HarnessError(f"Worker did not create a non-empty plan: {plan}")
-    result = read_json(result_path)
+    result = read_handoff(result_path)
+    if result.get("schema_version") != WORKER_RESULT_SCHEMA:
+        raise HarnessError(f"Worker result has an unsupported schema: {result_path}")
     result_status = str(result.get("status", "")).lower()
     if result_status == "blocked":
         summary = str(result.get("summary", "")).strip() or "Worker reported an unspecified blocker."
@@ -460,13 +630,19 @@ def _worker_result(run_dir: Path, index: int) -> tuple[Path, dict[str, Any]]:
     for field in ("changed_files", "checks", "limitations"):
         if not isinstance(result.get(field), list):
             raise HarnessError(f"Worker result field {field!r} must be an array: {result_path}")
-    if not all(isinstance(item, str) for item in result["changed_files"] + result["limitations"]):
+    if not all(isinstance(item, str) and item.strip() for item in result["changed_files"] + result["limitations"]):
         raise HarnessError(f"Worker result path/limitation entries must be text: {result_path}")
+    for item in result["changed_files"]:
+        candidate = Path(item)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise HarnessError(f"Worker result contains an unsafe changed path: {item}")
     for check in result["checks"]:
         if not isinstance(check, dict) or str(check.get("status", "")).lower() not in {"pass", "fail", "not_run"}:
             raise HarnessError(f"Worker result has an invalid check: {result_path}")
         if not all(isinstance(check.get(field), str) for field in ("name", "command", "details")):
             raise HarnessError(f"Worker check omitted required text fields: {result_path}")
+    if any(str(check.get("status", "")).lower() == "fail" for check in result["checks"]):
+        raise HarnessError(f"Worker reported completion with a failed check: {result_path}")
     return result_path, result
 
 
@@ -487,34 +663,105 @@ def _quarantine(path: Path) -> None:
     path.replace(candidate)
 
 
-def _workspace_snapshot(workspace: Path) -> dict[str, tuple[str, int, int, int]]:
-    """Detect reviewer writes without copying a potentially large workspace."""
-    snapshot: dict[str, tuple[str, int, int, int]] = {}
+def _is_excluded(path: Path, excluded: tuple[Path, ...]) -> bool:
+    resolved = path.resolve()
+    return any(resolved == item or item in resolved.parents for item in excluded)
+
+
+def _review_exclusions(run_dir: Path) -> tuple[Path, ...]:
+    return (
+        run_dir.parent,
+        RUNS_DIR,
+        ROOT / ".harness-current",
+        ROOT / ".harness-control.lock",
+        ROOT / ".harness-request.md",
+    )
+
+
+def _workspace_manifest(workspace: Path, excluded: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """Create a content-addressed identity for the delivered workspace."""
+    workspace = workspace.resolve()
+    excluded = tuple(path.resolve() for path in excluded)
+    entries: list[dict[str, Any]] = []
     for directory, subdirectories, files in os.walk(workspace, followlinks=False):
         base = Path(directory)
-        for name in [*subdirectories, *files]:
+        subdirectories[:] = sorted(
+            name
+            for name in subdirectories
+            if name != ".git" and not _is_excluded(base / name, excluded)
+        )
+        for name in sorted(files):
             path = base / name
+            if _is_excluded(path, excluded):
+                continue
             try:
-                stat = path.lstat()
-            except OSError:
-                continue
-            if path.is_dir() and not path.is_symlink():
-                snapshot[str(path.relative_to(workspace))] = ("directory", 0, 0, stat.st_mode)
-                continue
-            kind = "link" if path.is_symlink() else "file"
-            snapshot[str(path.relative_to(workspace))] = (kind, stat.st_size, stat.st_mtime_ns, stat.st_mode)
-    return snapshot
+                details = path.lstat()
+                relative = path.relative_to(workspace).as_posix()
+                mode = stat.S_IMODE(details.st_mode)
+                if path.is_symlink():
+                    entries.append({"path": relative, "kind": "link", "mode": mode, "target": os.readlink(path)})
+                    continue
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                entries.append(
+                    {"path": relative, "kind": "file", "mode": mode, "size": details.st_size, "sha256": digest.hexdigest()}
+                )
+            except OSError as error:
+                raise HarnessError(f"Could not fingerprint workspace file {path}: {error}") from error
+    encoded = json.dumps(entries, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "schema_version": ARTIFACT_SCHEMA,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "entry_count": len(entries),
+        "entries": entries,
+    }
 
 
-def _snapshot_changes(
-    before: dict[str, tuple[str, int, int, int]],
-    after: dict[str, tuple[str, int, int, int]],
-) -> list[str]:
-    return sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+def _manifest_changes(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    old = {entry["path"]: entry for entry in before.get("entries", [])}
+    new = {entry["path"]: entry for entry in after.get("entries", [])}
+    return sorted(path for path in old.keys() | new.keys() if old.get(path) != new.get(path))
+
+
+def _copy_workspace(workspace: Path, destination: Path, excluded: tuple[Path, ...] = ()) -> None:
+    excluded = tuple(path.resolve() for path in excluded)
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        base = Path(directory)
+        return {
+            name
+            for name in names
+            if name == ".git" or _is_excluded(base / name, excluded)
+        }
+
+    try:
+        shutil.copytree(workspace, destination, symlinks=True, ignore=ignore)
+    except OSError as error:
+        raise HarnessError(f"Could not create isolated review snapshot: {error}") from error
+
+
+def _verify_worker_changes(run_dir: Path, index: int, result: dict[str, Any]) -> None:
+    iteration_dir = run_dir / "iterations" / f"{index:02d}"
+    input_path = iteration_dir / "input-artifact.json"
+    if not input_path.is_file():
+        return
+    before = read_json(input_path)
+    workspace = Path(read_json(run_dir / "run-config.json")["workspace"])
+    after = _workspace_manifest(workspace, _review_exclusions(run_dir))
+    write_json(iteration_dir / "output-artifact.json", after)
+    actual = set(_manifest_changes(before, after))
+    claimed = set(result["changed_files"])
+    unreported = sorted(actual - claimed)
+    if unreported:
+        raise HarnessError("Worker omitted changed paths from its result: " + ", ".join(unreported[:20]))
 
 
 def _audit_result(path: Path) -> dict[str, Any]:
-    audit = read_json(path)
+    audit = read_handoff(path)
+    if audit.get("schema_version") != AUDIT_SCHEMA:
+        raise HarnessError(f"Reviewer audit has an unsupported schema: {path}")
     verdict = str(audit.get("verdict", "")).upper()
     if verdict not in {"PASS", "FIX"}:
         raise HarnessError(f"Reviewer verdict must be PASS or FIX: {path}")
@@ -525,7 +772,7 @@ def _audit_result(path: Path) -> dict[str, Any]:
         raise HarnessError(f"Reviewer issues must be an array of objects: {path}")
     if not isinstance(audit.get("checks"), list) or not isinstance(audit.get("limitations"), list):
         raise HarnessError(f"Reviewer checks and limitations must be arrays: {path}")
-    if not all(isinstance(item, str) for item in audit["limitations"]):
+    if not all(isinstance(item, str) and item.strip() for item in audit["limitations"]):
         raise HarnessError(f"Reviewer limitation entries must be text: {path}")
     for check in audit["checks"]:
         if not isinstance(check, dict) or str(check.get("status", "")).lower() not in {"pass", "fail", "not_run"}:
@@ -536,18 +783,16 @@ def _audit_result(path: Path) -> dict[str, Any]:
     for issue in issues:
         if str(issue.get("severity", "")).lower() not in severities:
             raise HarnessError(f"Reviewer issue has invalid severity: {path}")
-        if not str(issue.get("title", "")).strip():
-            raise HarnessError(f"Reviewer issue omitted its title: {path}")
         if not all(
-            isinstance(issue.get(field), str)
-            for field in ("location", "evidence", "required_fix", "acceptance_test")
+            isinstance(issue.get(field), str) and str(issue.get(field)).strip()
+            for field in ("title", "location", "evidence", "required_fix", "acceptance_test")
         ):
             raise HarnessError(f"Reviewer issue omitted required text fields: {path}")
     has_blocking_issue = any(str(issue.get("severity", "")).lower() in {"blocker", "major"} for issue in issues)
-    normalized_verdict = "FIX" if has_blocking_issue else "PASS"
-    if verdict != normalized_verdict:
-        audit["verdict"] = normalized_verdict
-        audit["summary"] += f" (Harness normalized {verdict} to {normalized_verdict} from issue severities.)"
+    has_failed_check = any(str(check.get("status", "")).lower() == "fail" for check in audit["checks"])
+    if verdict == "PASS" and (has_blocking_issue or has_failed_check):
+        audit["verdict"] = "FIX"
+        audit["summary"] += " (Harness changed PASS to FIX because blocking evidence remains.)"
         write_json(path, audit)
     return audit
 
@@ -568,6 +813,7 @@ def refresh_report(run_dir: Path) -> None:
         f"- Worker: `{state.get('worker_agent', '')}`",
         f"- Independent reviewer: `{state.get('reviewer_agent', '')}`",
         f"- Review round: {int(state.get('review_index', 0)) + 1} / {state.get('max_reviews', 0)}",
+        f"- Reviewed artifact: `{state.get('artifact_id', 'pending')}`",
         "",
         "## Request",
         "",
@@ -612,6 +858,8 @@ def refresh_report(run_dir: Path) -> None:
             "coordinator_detection": state.get("coordinator_detection"),
             "worker_agent": state.get("worker_agent"),
             "reviewer_agent": state.get("reviewer_agent"),
+            "artifact_id": state.get("artifact_id"),
+            "artifact_path": state.get("artifact_path"),
             "review_count": len(_audit_paths(run_dir)),
             "finished_at": state.get("finished_at"),
         },
@@ -638,6 +886,11 @@ def execute_run(run_dir: Path) -> int:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise HarnessError(f"Run already has an active supervisor: {run_dir}") from error
+        orphan_pid = active_agent_pid(state)
+        if orphan_pid:
+            raise HarnessError(
+                f"Run still has an active child agent (PID {orphan_pid}); stop it before resuming: {run_dir}"
+            )
         atomic_write(run_dir / "harness.pid", f"{os.getpid()}\n")
         if (run_dir / PAUSE_FILE).is_file():
             _update_state(run_dir, status="PAUSED", active_agent=None)
@@ -669,6 +922,12 @@ def execute_run(run_dir: Path) -> int:
                 if state.get("phase") == "work":
                     iteration_dir = run_dir / "iterations" / f"{index:02d}"
                     result_path = iteration_dir / "WORKER_RESULT.json"
+                    input_artifact_path = iteration_dir / "input-artifact.json"
+                    if not input_artifact_path.is_file():
+                        write_json(
+                            input_artifact_path,
+                            _workspace_manifest(Path(state["workspace"]), _review_exclusions(run_dir)),
+                        )
                     if not result_path.is_file():
                         if (run_dir / "WORKER_RESULT.json").is_file():
                             try:
@@ -691,23 +950,28 @@ def execute_run(run_dir: Path) -> int:
                             run_dir=str(run_dir),
                             review_feedback=feedback,
                         )
-                        run_agent(
-                            run_dir=run_dir,
-                            profile_name=worker_name,
-                            profile=config["profiles"][worker_name],
-                            role="TASK_WORKER",
-                            prompt=prompt,
-                            prompt_path=iteration_dir / "worker-prompt.md",
-                            log_path=iteration_dir / "worker.log",
-                            timeout_seconds=timeout,
-                        )
+                        guard = _control_guard(run_dir)
+                        try:
+                            run_agent(
+                                run_dir=run_dir,
+                                profile_name=worker_name,
+                                profile=config["profiles"][worker_name],
+                                role="TASK_WORKER",
+                                prompt=prompt,
+                                prompt_path=iteration_dir / "worker-prompt.md",
+                                log_path=iteration_dir / "worker.log",
+                                timeout_seconds=timeout,
+                            )
+                        finally:
+                            _verify_control_guard(run_dir, guard)
                         try:
                             _archive_worker_result(run_dir, index)
                         except HarnessError:
                             _quarantine(run_dir / "WORKER_RESULT.json")
                             raise
                     try:
-                        _worker_result(run_dir, index)
+                        _worker_path, verified_worker_result = _worker_result(run_dir, index)
+                        _verify_worker_changes(run_dir, index, verified_worker_result)
                     except WorkerBlocked:
                         blocked = result_path.with_name("WORKER_RESULT.blocked.json")
                         result_path.replace(blocked)
@@ -732,30 +996,40 @@ def execute_run(run_dir: Path) -> int:
                 _quarantine(audit_path)
                 _update_state(run_dir, status="REVIEWING")
                 print(f"[{index + 1}] independent review with {reviewer_name}", flush=True)
-                workspace_before_review = _workspace_snapshot(Path(state["workspace"]))
+                source_workspace = Path(state["workspace"])
+                exclusions = _review_exclusions(run_dir)
+                artifact_before = _workspace_manifest(source_workspace, exclusions)
+                write_json(review_dir / "artifact.json", artifact_before)
                 worker_report = f"Path: {worker_path}\n\n{json.dumps(worker_result, ensure_ascii=False, indent=2)}"
-                prompt = render_prompt(
-                    "reviewer",
-                    request=str(state["request"]),
-                    workspace=str(state["workspace"]),
-                    run_dir=str(run_dir),
-                    worker_report=worker_report,
-                    review_dir=str(review_dir),
-                )
-                run_agent(
-                    run_dir=run_dir,
-                    profile_name=reviewer_name,
-                    profile=config["profiles"][reviewer_name],
-                    role="TASK_REVIEWER",
-                    prompt=prompt,
-                    prompt_path=review_dir / "reviewer-prompt.md",
-                    log_path=review_dir / "reviewer.log",
-                    timeout_seconds=timeout,
-                )
-                reviewer_changes = _snapshot_changes(
-                    workspace_before_review,
-                    _workspace_snapshot(Path(state["workspace"])),
-                )
+                with tempfile.TemporaryDirectory(prefix="harness-review-") as temporary:
+                    review_workspace = Path(temporary) / "workspace"
+                    _copy_workspace(source_workspace, review_workspace, exclusions)
+                    prompt = render_prompt(
+                        "reviewer",
+                        request=str(state["request"]),
+                        workspace=str(review_workspace),
+                        run_dir=str(run_dir),
+                        worker_report=worker_report,
+                        review_dir=str(review_dir),
+                        artifact_id=str(artifact_before["sha256"]),
+                    )
+                    guard = _control_guard(run_dir, (worker_path,))
+                    try:
+                        run_agent(
+                            run_dir=run_dir,
+                            profile_name=reviewer_name,
+                            profile=config["profiles"][reviewer_name],
+                            role="TASK_REVIEWER",
+                            prompt=prompt,
+                            prompt_path=review_dir / "reviewer-prompt.md",
+                            log_path=review_dir / "reviewer.log",
+                            timeout_seconds=timeout,
+                            workspace=review_workspace,
+                        )
+                    finally:
+                        _verify_control_guard(run_dir, guard)
+                artifact_after = _workspace_manifest(source_workspace, exclusions)
+                reviewer_changes = _manifest_changes(artifact_before, artifact_after)
                 try:
                     audit = _audit_result(audit_path)
                 except HarnessError:
@@ -770,16 +1044,25 @@ def execute_run(run_dir: Path) -> int:
                         {
                             "severity": "major",
                             "location": "workspace",
-                            "title": "Reviewer modified the read-only workspace",
+                            "title": "Delivered workspace changed during review",
                             "evidence": "Changed paths: " + ", ".join(shown_changes),
-                            "required_fix": "Have the worker verify and restore the intended delivery; keep review evidence outside the workspace.",
-                            "acceptance_test": "Repeat the independent review with no workspace file changes.",
+                            "required_fix": "Restore the intended delivery and repeat review against a stable artifact.",
+                            "acceptance_test": "Repeat review and verify the workspace content hash remains unchanged.",
                         }
                     )
-                    write_json(audit_path, audit)
+                audit["artifact_id"] = artifact_before["sha256"]
+                write_json(audit_path, audit)
                 append_event(run_dir, "review_recorded", index=index, verdict=audit["verdict"])
                 if str(audit["verdict"]).upper() == "PASS":
-                    _update_state(run_dir, status="COMPLETE", active_agent=None, finished_at=now(), last_error="")
+                    _update_state(
+                        run_dir,
+                        status="COMPLETE",
+                        active_agent=None,
+                        artifact_id=artifact_before["sha256"],
+                        artifact_path=str((review_dir / "artifact.json").relative_to(run_dir)),
+                        finished_at=now(),
+                        last_error="",
+                    )
                     refresh_report(run_dir)
                     print(f"PASS: {run_dir}", flush=True)
                     return 0
@@ -803,6 +1086,11 @@ def execute_run(run_dir: Path) -> int:
             refresh_report(run_dir)
             print(f"PAUSED: {run_dir}", flush=True)
             return 2
+        except WorkerBlocked as error:
+            _update_state(run_dir, status="BLOCKED", active_agent=None, last_error=str(error))
+            append_event(run_dir, "run_blocked", reason=str(error))
+            refresh_report(run_dir)
+            raise
         except HarnessError as error:
             _update_state(run_dir, status="PAUSED", active_agent=None, last_error=str(error))
             append_event(run_dir, "run_failed", error=str(error))
