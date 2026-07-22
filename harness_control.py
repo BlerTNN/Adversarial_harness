@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
+import locale
 import os
 import subprocess
 import sys
@@ -15,34 +15,60 @@ from typing import Any
 
 from harness import (
     CONFIG_PATH,
-    PAUSE_FILE,
     ROOT,
     RUNS_DIR,
     STATE_SCHEMA,
     TERMINAL_STATUSES,
     HarnessError,
-    active_agent_pid,
+    active_agent_identity,
     append_event,
-    atomic_write,
+    clear_pause_request,
     create_run,
     detect_coordinator_agent,
     execute_run,
     load_config,
     now,
+    pause_requested,
     read_json,
+    read_process_marker,
+    remove_owned_process_marker,
     request_pause,
+    supervisor_marker_path,
+    supervisor_launch_lock_path,
     terminate_process_group,
+    validate_agent_profile,
     write_json,
+)
+from platform_support import (
+    configure_utf8_stdio,
+    file_lock,
+    format_command,
+    is_real_directory,
+    managed_process_start_time,
+    process_identity_status,
+    set_private_permissions,
+    spawn_detached_process,
 )
 
 
 HARNESS = ROOT / "harness.py"
 CURRENT_FILE = ROOT / ".harness-current"
 CONTROL_LOCK = ROOT / ".harness-control.lock"
+_DETACHED_PROCESSES: dict[int, subprocess.Popen[str]] = {}
 
 
 class ControlError(RuntimeError):
     pass
+
+
+def control_invocation() -> str:
+    return format_command([sys.executable, "harness_control.py"])
+
+
+def _reap_detached_processes() -> None:
+    for pid, process in tuple(_DETACHED_PROCESSES.items()):
+        if process.poll() is not None:
+            _DETACHED_PROCESSES.pop(pid, None)
 
 
 def ui_language() -> str:
@@ -51,9 +77,15 @@ def ui_language() -> str:
         or os.environ.get("LC_ALL")
         or os.environ.get("LC_MESSAGES")
         or os.environ.get("LANG")
-        or ""
     )
-    return "zh" if value.lower().replace("_", "-").startswith("zh") else "en"
+    if not value:
+        try:
+            value = locale.getlocale()[0]
+        except (ValueError, locale.Error):
+            value = ""
+    value = value or ""
+    normalized = value.casefold().replace("_", "-")
+    return "zh" if normalized.startswith("zh") or "chinese" in normalized else "en"
 
 
 def tr(english: str, chinese: str) -> str:
@@ -68,34 +100,43 @@ def safe_json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def real_control_directory(path: Path) -> Path | None:
+    lexical = Path(os.path.abspath(path.expanduser()))
+    return lexical.resolve() if is_real_directory(lexical) else None
+
+
 def generic_runs(runs_dir: Path = RUNS_DIR) -> list[Path]:
-    if not runs_dir.is_dir():
+    runs_root = real_control_directory(runs_dir)
+    if runs_root is None:
         return []
     paths = []
-    for path in runs_dir.iterdir():
-        if path.is_dir() and safe_json(path / "state.json").get("schema_version") == STATE_SCHEMA:
-            paths.append(path.resolve())
+    for path in runs_root.iterdir():
+        if is_real_directory(path) and safe_json(path / "state.json").get("schema_version") == STATE_SCHEMA:
+            resolved = path.resolve()
+            if resolved.parent == runs_root:
+                paths.append(resolved)
     return sorted(paths, key=lambda item: str(safe_json(item / "state.json").get("created_at", item.name)), reverse=True)
 
 
 def current_run(runs_dir: Path = RUNS_DIR) -> Path | None:
     candidate: Path | None = None
-    configured_root = runs_dir.expanduser().resolve()
+    configured_root = real_control_directory(runs_dir)
     try:
         raw = CURRENT_FILE.read_text(encoding="utf-8").strip()
         marker = json.loads(raw)
         if isinstance(marker, dict):
-            configured_root = Path(str(marker["runs_dir"])).expanduser().resolve()
-            candidate = Path(str(marker["run_dir"])).expanduser().resolve()
+            configured_root = real_control_directory(Path(str(marker["runs_dir"])))
+            candidate = real_control_directory(Path(str(marker["run_dir"])))
         else:
-            candidate = Path(raw).expanduser().resolve()
+            candidate = real_control_directory(Path(raw))
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         try:
-            candidate = Path(CURRENT_FILE.read_text(encoding="utf-8").strip()).expanduser().resolve()
+            candidate = real_control_directory(Path(CURRENT_FILE.read_text(encoding="utf-8").strip()))
         except (OSError, ValueError):
             candidate = None
     if (
         candidate
+        and configured_root
         and candidate.parent == configured_root
         and safe_json(candidate / "state.json").get("schema_version") == STATE_SCHEMA
     ):
@@ -105,8 +146,12 @@ def current_run(runs_dir: Path = RUNS_DIR) -> Path | None:
 
 
 def write_current(run_dir: Path, runs_dir: Path) -> None:
-    run_dir = run_dir.resolve()
-    runs_dir = runs_dir.expanduser().resolve()
+    real_run = real_control_directory(run_dir)
+    real_runs = real_control_directory(runs_dir)
+    if real_run is None or real_runs is None:
+        raise ControlError("Run and runs directory must be real directories, not links or junctions")
+    run_dir = real_run
+    runs_dir = real_runs
     if run_dir.parent != runs_dir:
         raise ControlError(f"Run is not a direct child of its configured runs directory: {run_dir}")
     write_json(
@@ -126,56 +171,167 @@ def unfinished_run(runs_dir: Path = RUNS_DIR) -> Path | None:
     )
 
 
-def _pid_command(pid: int) -> str:
-    try:
-        return subprocess.run(
-            ["/bin/ps", "-p", str(pid), "-o", "command="],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
+def supervisor_identity(run_dir: Path) -> tuple[str, int | None]:
+    _reap_detached_processes()
+    trusted_marker = supervisor_marker_path(run_dir)
+    marker = read_process_marker(trusted_marker)
+    if marker is None and not os.path.lexists(trusted_marker):
+        marker = read_process_marker(run_dir / "harness.pid")
+    if marker is None:
+        return ("unknown", None) if os.path.lexists(trusted_marker) else ("gone", None)
+    pid, started = marker
+    if not started:
+        return "unknown", pid
+    return process_identity_status(pid, started), pid
 
 
 def supervisor_pid(run_dir: Path) -> int | None:
-    try:
-        pid = int((run_dir / "harness.pid").read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return None
-    command = _pid_command(pid)
-    if "harness.py" in command and str(run_dir) in command:
-        return pid
-    return None
+    status, pid = supervisor_identity(run_dir)
+    return pid if status == "match" else None
 
 
 def run_lock_available(run_dir: Path) -> bool:
-    with (run_dir / "run.lock").open("a", encoding="utf-8") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    return True
+    try:
+        with file_lock(run_dir / "run.lock", blocking=False):
+            return True
+    except BlockingIOError:
+        return False
 
 
 def spawn_run(run_dir: Path) -> int:
+    _reap_detached_processes()
     log_path = run_dir / "harness.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as log:
-        log_path.chmod(0o600)
-        process = subprocess.Popen(
-            [sys.executable, str(HARNESS), "--resume", str(run_dir)],
-            cwd=ROOT,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-    atomic_write(run_dir / "harness.pid", f"{process.pid}\n")
-    append_event(run_dir, "supervisor_spawned", pid=process.pid)
+    environment = os.environ.copy()
+    environment["PYTHONUTF8"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
+    with file_lock(supervisor_launch_lock_path(run_dir)):
+        with log_path.open("a", encoding="utf-8") as log:
+            set_private_permissions(log_path)
+            try:
+                process = spawn_detached_process(
+                    [sys.executable, str(HARNESS), "--resume", str(run_dir)],
+                    cwd=ROOT,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=environment,
+                )
+            except (OSError, RuntimeError) as error:
+                message = tr(
+                    f"Could not start a safe detached Supervisor: {error}. "
+                    f"The run is PAUSED; resume it with `{control_invocation()} continue --foreground`.",
+                    f"无法安全启动后台 Supervisor：{error}。"
+                    f"Run 已保留为 PAUSED；请执行 `{control_invocation()} continue --foreground` 恢复。",
+                )
+                state = read_json(run_dir / "state.json")
+                state.update({"status": "PAUSED", "last_error": message, "updated_at": now()})
+                write_json(run_dir / "state.json", state)
+                append_event(run_dir, "supervisor_spawn_failed", error=str(error))
+                raise ControlError(message) from error
+        if process.poll() is not None:
+            process.wait(timeout=0)
+            message = tr(
+                "Detached Supervisor exited before accepting the run",
+                "后台 Supervisor 在接管 run 前已退出",
+            )
+            state = read_json(run_dir / "state.json")
+            state.update({"status": "PAUSED", "last_error": message, "updated_at": now()})
+            write_json(run_dir / "state.json", state)
+            append_event(run_dir, "supervisor_spawn_failed", error=message)
+            raise ControlError(message)
+        started = managed_process_start_time(process)
+        if not started:
+            process.kill()
+            process.wait(timeout=5)
+            message = tr(
+                "Detached Supervisor has no verifiable process identity",
+                "后台 Supervisor 没有可验证的进程身份",
+            )
+            state = read_json(run_dir / "state.json")
+            state.update({"status": "PAUSED", "last_error": message, "updated_at": now()})
+            write_json(run_dir / "state.json", state)
+            append_event(run_dir, "supervisor_spawn_failed", error=message)
+            raise ControlError(message)
+        marker = {"pid": process.pid, "pid_started": started}
+        marker_identity = (process.pid, started)
+        marker_paths = (supervisor_marker_path(run_dir), run_dir / "harness.pid")
+        try:
+            for marker_path in marker_paths:
+                write_json(marker_path, marker)
+            append_event(run_dir, "supervisor_spawned", pid=process.pid)
+        except BaseException as error:
+            cleanup_errors: list[str] = []
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError) as cleanup_error:
+                cleanup_errors.append(str(cleanup_error))
+            for marker_path in marker_paths:
+                try:
+                    remove_owned_process_marker(marker_path, marker_identity)
+                    marker_path.with_name(
+                        f"{marker_path.name}.tmp-{os.getpid()}"
+                    ).unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    cleanup_errors.append(str(cleanup_error))
+            cleanup_note = (
+                f" Cleanup also reported: {'; '.join(cleanup_errors)}"
+                if cleanup_errors
+                else ""
+            )
+            message = tr(
+                f"Could not publish the detached Supervisor identity safely: {error}. "
+                f"The Supervisor was stopped and the run is PAUSED.{cleanup_note}",
+                f"无法安全发布后台 Supervisor 身份：{error}。"
+                f"Supervisor 已停止，Run 已保留为 PAUSED。{cleanup_note}",
+            )
+            try:
+                state = read_json(run_dir / "state.json")
+                state.update({"status": "PAUSED", "last_error": message, "updated_at": now()})
+                write_json(run_dir / "state.json", state)
+            except (OSError, HarnessError):
+                pass
+            try:
+                append_event(run_dir, "supervisor_spawn_failed", error=str(error))
+            except (OSError, HarnessError):
+                pass
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise ControlError(message) from error
+    if process.poll() is None:
+        _DETACHED_PROCESSES[process.pid] = process
+    else:
+        try:
+            process.wait(timeout=0)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        for marker_path in marker_paths:
+            try:
+                remove_owned_process_marker(marker_path, marker_identity)
+                marker_path.with_name(
+                    f"{marker_path.name}.tmp-{os.getpid()}"
+                ).unlink(missing_ok=True)
+            except OSError:
+                pass
+        state = safe_json(run_dir / "state.json")
+        if str(state.get("status", "")).upper() not in TERMINAL_STATUSES:
+            message = str(state.get("last_error", "")).strip() or tr(
+                "Detached Supervisor exited before accepting the run",
+                "后台 Supervisor 在接管 run 前已退出",
+            )
+            try:
+                state.update({"status": "PAUSED", "last_error": message, "updated_at": now()})
+                write_json(run_dir / "state.json", state)
+            except (OSError, HarnessError):
+                pass
+            try:
+                append_event(run_dir, "supervisor_spawn_failed", error=message)
+            except (OSError, HarnessError):
+                pass
+            raise ControlError(message)
     return process.pid
 
 
@@ -186,8 +342,7 @@ def start(args: argparse.Namespace) -> int:
             request = args.request_file.expanduser().resolve().read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:
             raise ControlError(tr(f"Could not read request file: {error}", f"无法读取需求文件：{error}")) from error
-    with CONTROL_LOCK.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with file_lock(CONTROL_LOCK):
         existing = current_run(args.runs_dir)
         if existing and str(safe_json(existing / "state.json").get("status", "")).upper() in TERMINAL_STATUSES:
             existing = None
@@ -223,10 +378,11 @@ def start(args: argparse.Namespace) -> int:
         except HarnessError as error:
             raise ControlError(str(error)) from error
         write_current(run_dir, args.runs_dir)
-        if args.foreground:
-            print(tr(f"Task created: {run_dir}", f"已创建任务：{run_dir}"), flush=True)
-            return execute_run(run_dir)
-        pid = spawn_run(run_dir)
+        if not args.foreground:
+            pid = spawn_run(run_dir)
+    if args.foreground:
+        print(tr(f"Task created: {run_dir}", f"已创建任务：{run_dir}"), flush=True)
+        return execute_run(run_dir)
     state = read_json(run_dir / "state.json")
     print(tr(f"Submitted: {run_dir}", f"已提交：{run_dir}"))
     print(
@@ -239,16 +395,15 @@ def start(args: argparse.Namespace) -> int:
     )
     print(
         tr(
-            "The TUI can keep chatting; use `./harness_control.py status` to check progress.",
-            "TUI 可继续对话；用 `./harness_control.py status` 查看进度。",
+            f"The TUI can keep chatting; use `{control_invocation()} status` to check progress.",
+            f"TUI 可继续对话；用 `{control_invocation()} status` 查看进度。",
         )
     )
     return 0
 
 
 def continue_run(args: argparse.Namespace) -> int:
-    with CONTROL_LOCK.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with file_lock(CONTROL_LOCK):
         run_dir = current_run()
         if run_dir is None:
             raise ControlError(tr("There is no Harness task to resume.", "没有通用 Harness 任务可恢复。"))
@@ -257,8 +412,15 @@ def continue_run(args: argparse.Namespace) -> int:
         if status in TERMINAL_STATUSES:
             print(tr(f"Task is already {status}: {run_dir}", f"任务已经是 {status}：{run_dir}"))
             return 0
-        pid = supervisor_pid(run_dir)
-        if pid:
+        supervisor_status, pid = supervisor_identity(run_dir)
+        if supervisor_status == "unknown":
+            raise ControlError(
+                tr(
+                    "The recorded Supervisor identity cannot be verified; its state was preserved.",
+                    "无法验证已记录的 Supervisor 身份；现有状态已保留。",
+                )
+            )
+        if supervisor_status == "match" and pid:
             raise ControlError(
                 tr(
                     f"Task is still running (PID {pid}); it will not be started twice.",
@@ -272,8 +434,15 @@ def continue_run(args: argparse.Namespace) -> int:
                     "旧 Supervisor 尚未释放 run lock；暂停标记保持不变，请稍后再执行 continue。",
                 )
             )
-        active_pid = active_agent_pid(state)
-        if active_pid:
+        active_status, active_pid = active_agent_identity(state)
+        if active_status == "unknown":
+            raise ControlError(
+                tr(
+                    "The recorded child process identity cannot be verified; its state was preserved.",
+                    "无法验证已记录的子进程身份；现有状态已保留。",
+                )
+            )
+        if active_status == "match" and active_pid:
             raise ControlError(
                 tr(
                     f"The previous supervisor stopped but child agent PID {active_pid} is still running. Use stop, then continue.",
@@ -283,20 +452,20 @@ def continue_run(args: argparse.Namespace) -> int:
         if state.get("active_agent") is not None:
             state["active_agent"] = None
             write_json(run_dir / "state.json", state)
-        (run_dir / PAUSE_FILE).unlink(missing_ok=True)
+        clear_pause_request(run_dir)
         _state = read_json(run_dir / "state.json")
         _state.update({"status": "QUEUED", "last_error": "", "updated_at": now()})
         write_json(run_dir / "state.json", _state)
-        if args.foreground:
-            return execute_run(run_dir)
-        pid = spawn_run(run_dir)
+        if not args.foreground:
+            pid = spawn_run(run_dir)
+    if args.foreground:
+        return execute_run(run_dir)
     print(tr(f"Resumed original task: {run_dir} (PID {pid})", f"已恢复原任务：{run_dir}（PID {pid}）"))
     return 0
 
 
 def stop_run() -> int:
-    with CONTROL_LOCK.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with file_lock(CONTROL_LOCK):
         run_dir = current_run()
         if run_dir is None:
             raise ControlError(tr("There is no current Harness task.", "当前没有通用 Harness 任务。"))
@@ -305,15 +474,63 @@ def stop_run() -> int:
         if status in TERMINAL_STATUSES:
             print(tr(f"Task is already {status}; no stop is needed: {run_dir}", f"任务已经是 {status}，无需停止：{run_dir}"))
             return 0
-        request_pause(run_dir)
-        pid = supervisor_pid(run_dir)
-        if pid is None and run_lock_available(run_dir):
-            active = state.get("active_agent")
-            child_pid = active_agent_pid(state)
-            if child_pid and isinstance(active, dict):
-                terminate_process_group(child_pid, str(active.get("pid_started", "")))
-            state.update({"status": "PAUSED", "active_agent": None, "updated_at": now()})
-            write_json(run_dir / "state.json", state)
+        try:
+            request_pause(run_dir)
+        except HarnessError as error:
+            raise ControlError(str(error)) from error
+        supervisor_status, pid = supervisor_identity(run_dir)
+        if supervisor_status == "unknown":
+            raise ControlError(
+                tr(
+                    "The recorded Supervisor identity cannot be verified; the pause request and state were preserved.",
+                    "无法验证已记录的 Supervisor 身份；暂停请求与现有状态已保留。",
+                )
+            )
+        if supervisor_status != "match":
+            try:
+                with file_lock(run_dir / "run.lock", blocking=False):
+                    state = read_json(run_dir / "state.json")
+                    active = state.get("active_agent")
+                    child_status, child_pid = active_agent_identity(state)
+                    if child_status == "unknown":
+                        raise ControlError(
+                            tr(
+                                "The recorded child process identity cannot be verified; its state was preserved.",
+                                "无法验证已记录的子进程身份；现有状态已保留。",
+                            )
+                        )
+                    if child_status == "match" and child_pid and isinstance(active, dict):
+                        try:
+                            terminate_process_group(child_pid, str(active.get("pid_started", "")))
+                        except (OSError, RuntimeError) as error:
+                            raise ControlError(
+                                tr(
+                                    f"The orphan process tree could not be terminated safely: {error}",
+                                    f"无法安全终止遗留进程树：{error}",
+                                )
+                            ) from error
+                    final_status, _final_pid = active_agent_identity(
+                        read_json(run_dir / "state.json")
+                    )
+                    if final_status == "unknown":
+                        raise ControlError(
+                            tr(
+                                "The child process identity became unverifiable; its state was preserved.",
+                                "子进程身份变得无法验证；现有状态已保留。",
+                            )
+                        )
+                    if final_status == "match":
+                        raise ControlError(
+                            tr(
+                                "The child process is still running; its state was preserved.",
+                                "子进程仍在运行；其状态已保留。",
+                            )
+                        )
+                    state.update({"status": "PAUSED", "active_agent": None, "updated_at": now()})
+                    write_json(run_dir / "state.json", state)
+            except BlockingIOError:
+                # A supervisor owns the lock and will observe the pause marker.
+                pass
     print(tr(f"Safe pause requested: {run_dir}", f"已请求安全暂停：{run_dir}"))
     if pid:
         print(
@@ -330,16 +547,20 @@ def status_payload() -> dict[str, Any]:
     if run_dir is None:
         return {"schema_version": STATE_SCHEMA, "status": "IDLE", "run_dir": None, "harness_running": False}
     state = read_json(run_dir / "state.json")
-    pid = supervisor_pid(run_dir)
-    child_pid = active_agent_pid(state)
+    supervisor_status, supervisor_process = supervisor_identity(run_dir)
+    child_status, child_process = active_agent_identity(state)
+    pid = supervisor_process if supervisor_status == "match" else None
+    child_pid = child_process if child_status == "match" else None
     return {
         **state,
         "run_dir": str(run_dir),
         "harness_pid": pid,
         "harness_running": pid is not None,
+        "supervisor_identity_status": supervisor_status,
         "child_agent_running": child_pid is not None,
         "child_agent_pid": child_pid,
-        "operator_paused": (run_dir / PAUSE_FILE).is_file(),
+        "child_agent_identity_status": child_status,
+        "operator_paused": pause_requested(run_dir),
         "final_report": str(run_dir / "FINAL_REPORT.md") if (run_dir / "FINAL_REPORT.md").is_file() else None,
     }
 
@@ -413,7 +634,13 @@ def list_agents(config_path: Path, as_json: bool) -> int:
     rows = []
     for name, profile in config["agents"].items():
         executable = profile["command"][0]
-        available = bool(shutil_which(executable))
+        reason = ""
+        try:
+            validate_agent_profile(name, profile)
+            available = True
+        except HarnessError as error:
+            available = False
+            reason = str(error)
         rows.append(
             {
                 "name": name,
@@ -421,6 +648,7 @@ def list_agents(config_path: Path, as_json: bool) -> int:
                 "executable": executable,
                 "description": profile.get("description", ""),
                 "detected_coordinator": name == coordinator,
+                "unavailable_reason": reason or None,
             }
         )
     if as_json:
@@ -429,16 +657,9 @@ def list_agents(config_path: Path, as_json: bool) -> int:
         print(tr(f"Detected coordinator agent: {coordinator}", f"检测到的协调 Agent：{coordinator}"))
         for row in rows:
             print(f"{'✓' if row['available'] else '·'} {row['name']}: {row['executable']} — {row['description']}")
+            if row["unavailable_reason"]:
+                print(f"  {row['unavailable_reason']}")
     return 0
-
-
-def shutil_which(executable: str) -> str | None:
-    candidate = Path(executable).expanduser()
-    if candidate.parent != Path("."):
-        return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
-    from shutil import which
-
-    return which(executable)
 
 
 def parse_args() -> argparse.Namespace:
@@ -471,6 +692,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_utf8_stdio()
     args = parse_args()
     if args.command == "start":
         return start(args)

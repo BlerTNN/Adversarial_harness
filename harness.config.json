@@ -5,7 +5,7 @@
   "reviewer_agent": null,
   "max_reviews": 3,
   "timeout_seconds": 5400,
-  "verification_commands": [["python3", "-m", "compileall", "-q", "."]],
+  "verification_commands": [["{python}", "-m", "compileall", "-q", "."]],
   "verification_timeout_seconds": 600,
   "agents": {
     "hermes": {
@@ -18,7 +18,7 @@
       "description": "OpenAI Codex CLI using stdin for the non-interactive prompt.",
       "detect": ["codex"],
       "tui": ["codex"],
-      "command": ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--cd", "{workspace}", "--add-dir", "{run_dir}", "--skip-git-repo-check", "-"],
+      "command": ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-"],
       "stdin": "{prompt}"
     },
     "cursor": {
@@ -37,7 +37,7 @@
       "description": "Claude Code print mode with permission prompts skipped for unattended work.",
       "detect": ["claude"],
       "tui": ["claude"],
-      "command": ["claude", "--print", "--dangerously-skip-permissions", "--add-dir={run_dir}"],
+      "command": ["claude", "--print", "--dangerously-skip-permissions"],
       "stdin": "{prompt}"
     }
   }

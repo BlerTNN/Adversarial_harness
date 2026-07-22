@@ -6,12 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import socket
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+from platform_support import configure_utf8_stdio, is_real_directory
 
 
 ROOT = Path(__file__).resolve().parent
@@ -120,7 +123,7 @@ def run_log_paths(run_dir: Path) -> list[Path]:
 
 def log_entry(path: Path, run_dir: Path) -> dict[str, Any]:
     return {
-        "path": str(path.relative_to(run_dir)),
+        "path": path.relative_to(run_dir).as_posix(),
         "text": tail_text(path),
         "updated_at": file_mtime(path),
     }
@@ -143,9 +146,9 @@ def status_payload(root: Path = ROOT) -> dict[str, Any]:
     root = Path(root)
     runs_dir = root / "runs"
     records: list[dict[str, Any]] = []
-    if runs_dir.is_dir():
+    if is_real_directory(runs_dir):
         for run_dir in runs_dir.iterdir():
-            if run_dir.is_dir():
+            if is_real_directory(run_dir):
                 record = load_run(run_dir)
                 if record:
                     records.append(record)
@@ -249,17 +252,23 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+class ThreadingHTTPServerV6(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
 def make_server(
     root: Path = ROOT, host: str = "127.0.0.1", port: int = 8787
 ) -> ThreadingHTTPServer:
     if host not in {"127.0.0.1", "::1", "localhost"}:
         raise ValueError("The unauthenticated dashboard may only listen on localhost; use an SSH tunnel for remote access.")
-    server = ThreadingHTTPServer((host, port), Handler)
+    server_class = ThreadingHTTPServerV6 if ":" in host else ThreadingHTTPServer
+    server = server_class((host, port), Handler)
     server.dashboard_root = Path(root)  # type: ignore[attr-defined]
     return server
 
 
 def main() -> None:
+    configure_utf8_stdio()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
@@ -268,7 +277,9 @@ def main() -> None:
         server = make_server(ROOT, args.host, args.port)
     except ValueError as error:
         parser.error(str(error))
-    print(f"Harness status dashboard: http://{args.host}:{args.port}", flush=True)
+    bound_port = int(server.server_address[1])
+    display_host = f"[{args.host}]" if ":" in args.host else args.host
+    print(f"Harness status dashboard: http://{display_host}:{bound_port}", flush=True)
     server.serve_forever()
 
 

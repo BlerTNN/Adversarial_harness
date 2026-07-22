@@ -54,7 +54,7 @@ all of these fields:
 - `schema_version`: exactly `generic-harness/worker-result/v1`;
 - `status`: `complete` or `blocked`;
 - `summary`: concise factual string;
-- `changed_files`: array of workspace-relative paths;
+- `changed_files`: array of workspace-relative paths using `/` separators on every OS;
 - `checks`: array of objects with `name`, `command`, `status`, and `details`,
   where status is `pass`, `fail`, or `not_run`;
 - `limitations`: array of strings.

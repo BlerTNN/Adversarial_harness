@@ -60,7 +60,8 @@ under the matching iteration. The result must contain:
 ```
 
 `status` must be `complete` or `blocked`. Each `checks[].status` must be `pass`,
-`fail`, or `not_run`.
+`fail`, or `not_run`. Every `changed_files` entry is workspace-relative and uses
+`/` separators, including when the worker runs on Windows.
 
 The reviewer writes its structured result to `{review_dir}/AUDIT.json`:
 

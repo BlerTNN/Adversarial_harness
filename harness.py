@@ -8,14 +8,11 @@ module only runs configured headless agents against a persistent workspace.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
-import signal
 import stat
 import string
 import subprocess
@@ -27,6 +24,24 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from platform_support import (
+    WINDOWS,
+    acquire_file_lock,
+    configure_utf8_stdio,
+    file_lock,
+    format_command,
+    managed_process_start_time,
+    parent_commands,
+    process_group_identity_status,
+    process_identity_status,
+    pid_start_time,
+    resolve_program,
+    set_private_permissions,
+    spawn_managed_process,
+    terminate_managed_process,
+    terminate_process_group,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -42,6 +57,9 @@ TERMINAL_STATUSES = {"COMPLETE", "INCOMPLETE"}
 PAUSE_FILE = ".operator-paused"
 MAX_HANDOFF_BYTES = 1_000_000
 MAX_ARG_PROMPT_BYTES = 100_000
+MAX_WINDOWS_COMMAND_LINE = 30_000
+MAX_WINDOWS_BATCH_COMMAND_LINE = 8_000
+WINDOWS_BATCH_METACHARACTERS = "%!^&|<>()\r\n\""
 MAX_VERIFICATION_DETAILS = 8_000
 PROTECTED_STATE_FIELDS = (
     "schema_version",
@@ -82,20 +100,168 @@ def now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _make_writable(path: Path) -> None:
+    try:
+        mode = path.lstat().st_mode
+        if WINDOWS:
+            os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+        else:
+            writable = stat.S_IMODE(mode) | stat.S_IRUSR | stat.S_IWUSR
+            if stat.S_ISDIR(mode):
+                writable |= stat.S_IXUSR
+            os.chmod(path, writable)
+    except OSError:
+        return
+
+
+def _restore_mode(path: Path, original: os.stat_result) -> None:
+    """Restore permissions only when the same non-link entry still owns the path."""
+    try:
+        current = path.lstat()
+        if (
+            current.st_dev == original.st_dev
+            and current.st_ino == original.st_ino
+            and not path.is_symlink()
+            and not _is_junction(path, current)
+        ):
+            os.chmod(path, stat.S_IMODE(original.st_mode))
+    except OSError:
+        return
+
+
+def _replace_path(source: Path, destination: Path) -> None:
+    retry_deadline = time.monotonic() + 0.75
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as error:
+            if not WINDOWS or not os.path.lexists(destination):
+                raise
+            if destination.is_symlink() or _is_junction(destination):
+                raise PermissionError(f"Refusing to change permissions through a link: {destination}") from error
+            original = destination.lstat()
+            if not original.st_mode & stat.S_IWRITE:
+                break
+            if getattr(error, "winerror", None) in {32, 33} and time.monotonic() < retry_deadline:
+                time.sleep(0.025)
+                continue
+            raise PermissionError(f"Could not replace writable destination: {destination}") from error
+    _make_writable(destination)
+    try:
+        while True:
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError as error:
+                if getattr(error, "winerror", None) not in {32, 33} or time.monotonic() >= retry_deadline:
+                    raise
+                time.sleep(0.025)
+    except BaseException:
+        _restore_mode(destination, original)
+        raise
+
+
+def _is_reparse_point(path: Path, details: os.stat_result | None = None) -> bool:
+    if not WINDOWS:
+        return False
+    try:
+        details = details or path.lstat()
+    except OSError:
+        return False
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    return bool(int(getattr(details, "st_file_attributes", 0)) & flag)
+
+
+def _is_junction(path: Path, details: os.stat_result | None = None) -> bool:
+    try:
+        details = details or path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(details.st_mode) and _is_reparse_point(path, details) and not path.is_symlink()
+
+
+def _is_real_directory(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(details.st_mode) and not path.is_symlink() and not _is_junction(path, details)
+
+
+def _real_directory_root(path: Path, label: str) -> Path:
+    """Return a lexical absolute root after rejecting a replaced link/junction."""
+    root = Path(os.path.abspath(path.expanduser()))
+    try:
+        details = root.lstat()
+    except OSError as error:
+        raise HarnessError(f"{label} is unavailable: {root}: {error}") from error
+    if not stat.S_ISDIR(details.st_mode) or root.is_symlink() or _is_junction(root, details):
+        raise HarnessError(f"{label} must be a real directory, not a symbolic link or junction: {root}")
+    return root
+
+
+def _runtime_control_path(run_dir: Path, suffix: str) -> Path:
+    """Return a Harness-owned control path that is never authorized to child roles."""
+    lexical_run = os.path.normcase(os.path.abspath(run_dir.expanduser()))
+    key = hashlib.sha256(lexical_run.encode("utf-8")).hexdigest()
+    runtime_root = Path(lexical_run).parent / ".harness-runtime"
+    if not os.path.lexists(runtime_root):
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        set_private_permissions(runtime_root, directory=True)
+    root = _real_directory_root(runtime_root, "Runtime control directory")
+    return root / f"{key}.{suffix}"
+
+
+def supervisor_marker_path(run_dir: Path) -> Path:
+    return _runtime_control_path(run_dir, "pid")
+
+
+def supervisor_launch_lock_path(run_dir: Path) -> Path:
+    return _runtime_control_path(run_dir, "launch.lock")
+
+
+def pause_request_path(run_dir: Path) -> Path:
+    return _runtime_control_path(run_dir, "pause")
+
+
+def pause_requested(run_dir: Path) -> bool:
+    return pause_request_path(run_dir).is_file()
+
+
+def clear_pause_request(run_dir: Path) -> None:
+    pause_request_path(run_dir).unlink(missing_ok=True)
+    legacy = run_dir / PAUSE_FILE
+    if legacy.is_file() or legacy.is_symlink():
+        legacy.unlink(missing_ok=True)
+
+
+def _is_git_name(name: str) -> bool:
+    return name.casefold() == ".git"
+
+
+def _contains_git_part(path: Path) -> bool:
+    return any(_is_git_name(part) for part in path.parts)
+
+
+def _run_relative(path: Path, run_dir: Path) -> str:
+    return path.relative_to(run_dir).as_posix()
+
+
 def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     temporary.write_text(content, encoding="utf-8")
-    temporary.chmod(0o600)
-    temporary.replace(path)
+    set_private_permissions(temporary)
+    _replace_path(temporary, path)
 
 
 def atomic_write_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     temporary.write_bytes(content)
-    temporary.chmod(0o600)
-    temporary.replace(path)
+    set_private_permissions(temporary)
+    _replace_path(temporary, path)
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
@@ -112,6 +278,35 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def write_process_marker(path: Path, pid: int) -> tuple[int, str]:
+    started = pid_start_time(pid)
+    if not started:
+        raise HarnessError(f"Could not establish a safe process identity for PID {pid}")
+    write_json(path, {"pid": pid, "pid_started": started})
+    return pid, started
+
+
+def read_process_marker(path: Path) -> tuple[int, str] | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        value = json.loads(raw)
+        if isinstance(value, dict):
+            pid = int(value.get("pid", 0))
+            started = str(value.get("pid_started", ""))
+        else:
+            pid = int(value)
+            started = ""
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return (pid, started) if pid > 0 else None
+
+
+def remove_owned_process_marker(path: Path, identity: tuple[int, str]) -> None:
+    """Remove a marker only when both PID and creation token still match."""
+    if read_process_marker(path) == identity:
+        path.unlink(missing_ok=True)
+
+
 def read_handoff(path: Path) -> dict[str, Any]:
     try:
         if path.stat().st_size > MAX_HANDOFF_BYTES:
@@ -125,81 +320,39 @@ def append_event(run_dir: Path, event: str, **details: Any) -> None:
     path = run_dir / "events.jsonl"
     lock_path = run_dir / "events.lock"
     payload = {"time": now(), "event": event, **details}
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with file_lock(lock_path):
         with path.open("a", encoding="utf-8") as output:
             output.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        path.chmod(0o600)
-
-
-def pid_start_time(pid: int) -> str:
-    try:
-        return subprocess.run(
-            ["/bin/ps", "-p", str(pid), "-o", "lstart="],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
-def pid_status(pid: int) -> str:
-    try:
-        return subprocess.run(
-            ["/bin/ps", "-p", str(pid), "-o", "stat="],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
-def process_matches(pid: int, started: str = "") -> bool:
-    if pid < 1:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        pass
-    status = pid_status(pid)
-    if not status or status.startswith("Z"):
-        return False
-    current = pid_start_time(pid)
-    return not started or not current or current == started
+        set_private_permissions(path)
 
 
 def active_agent_pid(state: dict[str, Any]) -> int | None:
+    status, pid = active_agent_identity(state)
+    return pid if status == "match" else None
+
+
+def active_agent_identity(state: dict[str, Any]) -> tuple[str, int | None]:
     active = state.get("active_agent")
+    if active is None:
+        return "gone", None
     if not isinstance(active, dict):
-        return None
+        return "unknown", None
     try:
         pid = int(active.get("pid", 0))
+        process_group = int(active.get("process_group", pid))
     except (TypeError, ValueError):
-        return None
-    return pid if process_matches(pid, str(active.get("pid_started", ""))) else None
-
-
-def terminate_process_group(pid: int, started: str = "", grace: float = 5.0) -> None:
-    if not process_matches(pid, started):
-        return
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    deadline = time.monotonic() + grace
-    while process_matches(pid, started) and time.monotonic() < deadline:
-        time.sleep(0.1)
-    if process_matches(pid, started):
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        return "unknown", None
+    if pid < 1 or process_group != pid:
+        return "unknown", pid if pid > 0 else None
+    started = str(active.get("pid_started", ""))
+    if not started:
+        return "unknown", process_group
+    status = (
+        process_identity_status(pid, started)
+        if WINDOWS
+        else process_group_identity_status(process_group, started)
+    )
+    return status, process_group
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -271,27 +424,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
 
 
 def _parent_commands(limit: int = 12) -> list[str]:
-    commands: list[str] = []
-    pid = os.getppid()
-    for _ in range(limit):
-        try:
-            result = subprocess.run(
-                ["/bin/ps", "-p", str(pid), "-o", "ppid=,command="],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=2,
-            )
-        except (OSError, subprocess.SubprocessError):
-            break
-        fields = result.stdout.strip().split(None, 1)
-        if len(fields) != 2 or not fields[0].isdigit():
-            break
-        pid = int(fields[0])
-        commands.append(fields[1])
-        if pid <= 1:
-            break
-    return commands
+    return parent_commands(limit)
 
 
 def detect_coordinator(config: dict[str, Any]) -> tuple[str, str]:
@@ -307,7 +440,10 @@ def detect_coordinator(config: dict[str, Any]) -> tuple[str, str]:
         needles = profile.get("detect", [name])
         if isinstance(needles, list) and any(
             isinstance(needle, str)
-            and re.search(rf"(?:^|[/\s]){re.escape(needle.casefold())}(?:\.js)?(?:\s|$)", process_text)
+            and re.search(
+                rf"(?:^|[\\/\s\"']){re.escape(needle.casefold())}(?:\.js|\.exe|\.cmd|\.bat)?(?=[\s\"']|$)",
+                process_text,
+            )
             for needle in needles
         ):
             return name, "process"
@@ -330,15 +466,47 @@ def _resolve_executable(command: list[str], profile_name: str) -> str:
     executable = command[0]
     if "{" in executable:
         raise HarnessError(f"The executable itself cannot be a placeholder: {profile_name}")
-    candidate = Path(executable).expanduser()
-    if candidate.parent != Path("."):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate.resolve())
-    else:
-        found = shutil.which(executable)
-        if found:
-            return found
+    found = resolve_program(executable)
+    if found:
+        return found
     raise HarnessError(f"Agent executable is unavailable for profile {profile_name}: {executable}")
+
+
+def _command_template_fields(command: list[str]) -> set[str]:
+    return {
+        field
+        for item in command
+        for _literal, field, _spec, _conversion in string.Formatter().parse(item)
+        if field
+    }
+
+
+def _windows_batch_argv_has_metacharacters(command: list[str]) -> bool:
+    return WINDOWS and Path(command[0]).suffix.casefold() in {".bat", ".cmd"} and any(
+        any(character in item for character in WINDOWS_BATCH_METACHARACTERS)
+        for item in command
+    )
+
+
+def validate_agent_profile(profile_name: str, profile: dict[str, Any]) -> str:
+    """Resolve one profile and reject Windows batch argv that cmd could reinterpret."""
+    command = profile["command"]
+    executable = _resolve_executable(command, profile_name)
+    if not WINDOWS or Path(executable).suffix.casefold() not in {".bat", ".cmd"}:
+        return executable
+    fields = _command_template_fields(command)
+    if fields:
+        raise HarnessError(
+            f"Windows batch-wrapper profile {profile_name} cannot receive runtime placeholders in argv "
+            f"({', '.join(sorted(fields))}); configure a static command with stdin or use a native executable"
+        )
+    resolved_command = [executable, *command[1:]]
+    if _windows_batch_argv_has_metacharacters(resolved_command):
+        raise HarnessError(
+            f"Windows batch-wrapper profile {profile_name} has cmd.exe metacharacters in its executable or argv; "
+            "use a native executable"
+        )
+    return executable
 
 
 def _new_run_dir(runs_dir: Path) -> Path:
@@ -348,6 +516,7 @@ def _new_run_dir(runs_dir: Path) -> Path:
     if candidate.exists():
         candidate = runs_dir / f"{stem}-{uuid.uuid4().hex[:6]}"
     candidate.mkdir(mode=0o700)
+    set_private_permissions(candidate, directory=True)
     return candidate.resolve()
 
 
@@ -381,16 +550,25 @@ def create_run(
     workspace_path = workspace.expanduser() if workspace else configured_workspace
     if not workspace_path.is_absolute():
         workspace_path = config_path.parent / workspace_path
-    workspace_path = workspace_path.resolve()
-    if workspace_path in {Path("/"), Path.home().resolve()}:
+    lexical_workspace = Path(os.path.abspath(workspace_path))
+    lexical_home = Path(os.path.abspath(Path.home()))
+    if lexical_workspace.parent == lexical_workspace or lexical_workspace == lexical_home:
+        raise HarnessError(f"Refusing a workspace that is too broad: {lexical_workspace}")
+    if not os.path.lexists(lexical_workspace):
+        lexical_workspace.mkdir(parents=True, exist_ok=True)
+    workspace_path = _real_directory_root(lexical_workspace, "Workspace").resolve()
+    resolved_home = Path.home().resolve()
+    if workspace_path.parent == workspace_path or workspace_path == resolved_home:
         raise HarnessError(f"Refusing a workspace that is too broad: {workspace_path}")
-    workspace_path.mkdir(parents=True, exist_ok=True)
 
     selected_profiles = {name: config["agents"][name] for name in {worker, reviewer}}
     for name, profile in selected_profiles.items():
-        _resolve_executable(profile["command"], name)
+        validate_agent_profile(name, profile)
 
-    runs_path = runs_dir.expanduser().resolve()
+    lexical_runs = Path(os.path.abspath(runs_dir.expanduser()))
+    if not os.path.lexists(lexical_runs):
+        lexical_runs.mkdir(parents=True, exist_ok=True)
+    runs_path = _real_directory_root(lexical_runs, "Runs directory").resolve()
     if runs_path == workspace_path:
         raise HarnessError("runs_dir cannot be the workspace itself")
     if runs_path in workspace_path.parents:
@@ -406,6 +584,10 @@ def create_run(
     live_after_copy = _workspace_manifest(workspace_path, exclusions)
     if copied_artifact["sha256"] != base_artifact["sha256"] or live_after_copy["sha256"] != base_artifact["sha256"]:
         raise HarnessError("Workspace changed while the isolated candidate was being created")
+    verification_commands = [
+        [sys.executable if argument == "{python}" else argument for argument in command]
+        for command in config.get("verification_commands", [])
+    ]
     run_config = {
         "schema_version": STATE_SCHEMA,
         "source_config": str(config_path),
@@ -417,7 +599,7 @@ def create_run(
         "reviewer_agent": reviewer,
         "max_reviews": reviews,
         "timeout_seconds": timeout,
-        "verification_commands": config.get("verification_commands", []),
+        "verification_commands": verification_commands,
         "verification_timeout_seconds": int(config.get("verification_timeout_seconds", 600)),
         "profiles": selected_profiles,
     }
@@ -453,9 +635,17 @@ def create_run(
 
 
 def request_pause(run_dir: Path) -> Path:
-    path = run_dir / PAUSE_FILE
-    if not path.exists():
-        atomic_write(path, json.dumps({"requested_at": now()}, ensure_ascii=False) + "\n")
+    payload = json.dumps({"requested_at": now()}, ensure_ascii=False) + "\n"
+    path = pause_request_path(run_dir)
+    atomic_write(path, payload)
+    # Keep the historical marker as a human-visible breadcrumb only. Child
+    # roles can reach their run directory, so execution never trusts it.
+    legacy = run_dir / PAUSE_FILE
+    try:
+        if not legacy.exists():
+            atomic_write(legacy, payload)
+    except OSError:
+        pass
     return path
 
 
@@ -486,19 +676,10 @@ def render_prompt(name: str, **values: str) -> str:
 
 
 def _terminate(process: subprocess.Popen[str], grace: float = 5.0) -> None:
-    if process.poll() is not None:
-        return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=grace)
-    except ProcessLookupError:
-        return
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        process.wait()
+        terminate_managed_process(process, grace)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise HarnessError(f"Could not terminate managed process tree for PID {process.pid}: {error}") from error
 
 
 def _isolated_process_environment(workspace: Path) -> dict[str, str]:
@@ -512,12 +693,14 @@ def _isolated_process_environment(workspace: Path) -> dict[str, str]:
     ):
         environment.pop(name, None)
     environment["GIT_CEILING_DIRECTORIES"] = str(workspace.resolve().parent)
+    environment["PYTHONUTF8"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
     return environment
 
 
 def _control_guard(run_dir: Path, protected_files: tuple[Path, ...] = ()) -> dict[str, Any]:
     state = read_json(run_dir / "state.json")
-    evidence = [run_dir / "base-artifact.json", run_dir / "request.md"]
+    evidence = [run_dir / "base-artifact.json", run_dir / "request.md", run_dir / "harness.pid"]
     for pattern in (
         "iterations/*/input-artifact.json",
         "iterations/*/output-artifact.json",
@@ -541,6 +724,7 @@ def _control_guard(run_dir: Path, protected_files: tuple[Path, ...] = ()) -> dic
         "config": read_json(run_dir / "run-config.json"),
         "state_document": state,
         "state": {field: state.get(field) for field in PROTECTED_STATE_FIELDS},
+        "active_agent": state.get("active_agent"),
         "files": protected_contents,
     }
 
@@ -565,14 +749,17 @@ def _verify_control_guard(run_dir: Path, guard: dict[str, Any]) -> None:
         state = None
     if state is None:
         state = dict(guard["state_document"])
-        state["active_agent"] = None
+        state["active_agent"] = guard.get("active_agent")
         write_json(state_path, state)
         changed.append("state.json")
     for field, expected in guard["state"].items():
         if state.get(field) != expected:
             state[field] = expected
             changed.append(f"state.json:{field}")
-    state["active_agent"] = None
+    expected_active = guard.get("active_agent")
+    if state.get("active_agent") != expected_active:
+        state["active_agent"] = expected_active
+        changed.append("state.json:active_agent")
     if changed:
         write_json(state_path, state)
 
@@ -589,7 +776,7 @@ def _verify_control_guard(run_dir: Path, guard: dict[str, Any]) -> None:
             actual = None
         if actual != expected:
             atomic_write_bytes(path, expected)
-            changed.append(str(path.relative_to(run_dir)))
+            changed.append(_run_relative(path, run_dir))
     if changed:
         raise HarnessError("Agent modified protected Harness control data: " + ", ".join(changed))
 
@@ -605,6 +792,7 @@ def run_agent(
     log_path: Path,
     timeout_seconds: int,
     workspace: Path | None = None,
+    guard: dict[str, Any] | None = None,
 ) -> None:
     workspace = workspace or Path(read_json(run_dir / "run-config.json")["workspace"])
     atomic_write(prompt_path, prompt + "\n")
@@ -616,7 +804,9 @@ def run_agent(
         role=role,
     )
     try:
-        if any("{prompt}" in item for item in profile["command"]) and len(prompt.encode()) > MAX_ARG_PROMPT_BYTES:
+        argv_fields = _command_template_fields(profile["command"])
+        prompt_in_argv = "prompt" in argv_fields
+        if prompt_in_argv and not WINDOWS and len(prompt.encode()) > MAX_ARG_PROMPT_BYTES:
             raise HarnessError(
                 f"Prompt is too large for argv ({len(prompt.encode())} bytes); use stdin or {{prompt_file}} for {profile_name}"
             )
@@ -625,16 +815,25 @@ def run_agent(
         stdin_value = stdin_text.format_map(values) if isinstance(stdin_text, str) else None
     except (KeyError, ValueError) as error:
         raise HarnessError(f"Invalid agent command template for {profile_name}: {error}") from error
-    command[0] = _resolve_executable(command, profile_name)
+    command[0] = validate_agent_profile(profile_name, profile)
+    windows_batch = WINDOWS and Path(command[0]).suffix.casefold() in {".bat", ".cmd"}
+    windows_command_units = (
+        len(format_command(command).encode("utf-16-le")) // 2 if WINDOWS else 0
+    )
+    windows_limit = MAX_WINDOWS_BATCH_COMMAND_LINE if windows_batch else MAX_WINDOWS_COMMAND_LINE
+    if WINDOWS and windows_command_units >= windows_limit:
+        raise HarnessError(
+            f"Command exceeds the safe Windows command-line limit; use stdin or {{prompt_file}} for {profile_name}"
+        )
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     shown = [item.replace(prompt, "<prompt>") if prompt else item for item in command]
     with log_path.open("a", encoding="utf-8") as log:
-        log_path.chmod(0o600)
-        log.write(f"\n[{now()}] {role} via {profile_name}\n$ {shlex.join(shown)}\n")
+        set_private_permissions(log_path)
+        log.write(f"\n[{now()}] {role} via {profile_name}\n$ {format_command(shown)}\n")
         log.flush()
         try:
-            process = subprocess.Popen(
+            process = spawn_managed_process(
                 command,
                 cwd=workspace,
                 env=_isolated_process_environment(workspace),
@@ -642,47 +841,78 @@ def run_agent(
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 text=True,
-                start_new_session=True,
+                encoding="utf-8",
             )
-        except OSError as error:
+        except (OSError, RuntimeError) as error:
             raise HarnessError(f"Could not launch {profile_name}: {error}") from error
-        if process.stdin is not None:
-            try:
-                process.stdin.write(stdin_value or "")
-                process.stdin.close()
-            except BrokenPipeError:
-                pass
-
-        _update_state(
-            run_dir,
-            active_agent={
+        try:
+            process_started = managed_process_start_time(process)
+            if not process_started:
+                raise HarnessError(f"Could not establish a safe process identity for {profile_name}")
+            active_agent = {
                 "profile": profile_name,
                 "role": role,
                 "pid": process.pid,
                 "process_group": process.pid,
-                "pid_started": pid_start_time(process.pid),
-                "log": str(log_path.relative_to(run_dir)),
+                "pid_started": process_started,
+                "log": _run_relative(log_path, run_dir),
                 "started_at": now(),
-            },
-        )
-        append_event(run_dir, "agent_started", profile=profile_name, role=role, pid=process.pid)
-        effective_timeout = int(profile.get("timeout_seconds", timeout_seconds))
-        deadline = time.monotonic() + effective_timeout
-        started_monotonic = time.monotonic()
-        paused = False
-        timed_out = False
-        while process.poll() is None:
-            if (run_dir / PAUSE_FILE).is_file():
-                paused = True
+            }
+            if guard is not None:
+                guard["active_agent"] = active_agent
+            _update_state(run_dir, active_agent=active_agent)
+            append_event(run_dir, "agent_started", profile=profile_name, role=role, pid=process.pid)
+            effective_timeout = int(profile.get("timeout_seconds", timeout_seconds))
+            deadline = time.monotonic() + effective_timeout
+            started_monotonic = time.monotonic()
+            paused = False
+            timed_out = False
+            communication_started = False
+            while process.poll() is None:
+                if pause_requested(run_dir):
+                    paused = True
+                    _terminate(process)
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    _terminate(process)
+                    break
+                wait_seconds = max(0.01, min(0.25, deadline - time.monotonic()))
+                try:
+                    if stdin_value is not None:
+                        process.communicate(
+                            input=None if communication_started else stdin_value,
+                            timeout=wait_seconds,
+                        )
+                        communication_started = True
+                    else:
+                        process.wait(timeout=wait_seconds)
+                except subprocess.TimeoutExpired:
+                    communication_started = communication_started or stdin_value is not None
+            if stdin_value is not None:
+                process.communicate()
+            returncode = process.wait()
+            try:
+                _terminate(process, grace=1.0)
+            finally:
+                if process.stdin is not None:
+                    process.stdin.close()
+        except BaseException:
+            try:
                 _terminate(process)
-                break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                _terminate(process)
-                break
-            time.sleep(0.25)
-        returncode = process.wait()
+            finally:
+                if process.stdin is not None:
+                    process.stdin.close()
+            if guard is not None:
+                guard["active_agent"] = None
+            try:
+                _update_state(run_dir, active_agent=None)
+            except (OSError, HarnessError):
+                pass
+            raise
 
+    if guard is not None:
+        guard["active_agent"] = None
     _update_state(run_dir, active_agent=None)
     append_event(
         run_dir,
@@ -723,10 +953,15 @@ def _worker_result(run_dir: Path, index: int) -> tuple[Path, dict[str, Any]]:
             raise HarnessError(f"Worker result field {field!r} must be an array: {result_path}")
     if not all(isinstance(item, str) and item.strip() for item in result["changed_files"] + result["limitations"]):
         raise HarnessError(f"Worker result path/limitation entries must be text: {result_path}")
+    normalized_changes: list[str] = []
     for item in result["changed_files"]:
         candidate = Path(item)
-        if candidate.is_absolute() or ".." in candidate.parts:
+        if candidate.anchor or candidate == Path(".") or ".." in candidate.parts:
             raise HarnessError(f"Worker result contains an unsafe changed path: {item}")
+        normalized_changes.append(candidate.as_posix())
+    if normalized_changes != result["changed_files"]:
+        result["changed_files"] = normalized_changes
+        write_json(result_path, result)
     for check in result["checks"]:
         if not isinstance(check, dict) or str(check.get("status", "")).lower() not in {"pass", "fail", "not_run"}:
             raise HarnessError(f"Worker result has an invalid check: {result_path}")
@@ -743,6 +978,7 @@ def _archive_worker_result(run_dir: Path, index: int) -> Path:
     result = read_json(current)
     archived = run_dir / "iterations" / f"{index:02d}" / "WORKER_RESULT.json"
     write_json(archived, result)
+    current.unlink(missing_ok=True)
     return archived
 
 
@@ -775,8 +1011,13 @@ def _candidate_workspace(run_dir: Path) -> Path:
     expected = Path(os.path.abspath(run_dir / "candidate"))
     if candidate != expected:
         raise HarnessError(f"Invalid candidate workspace for run: {candidate}")
-    if os.path.lexists(candidate) and candidate.is_symlink():
-        raise HarnessError("The isolated candidate workspace cannot be a symbolic link")
+    if os.path.lexists(candidate):
+        try:
+            details = candidate.lstat()
+        except OSError as error:
+            raise HarnessError(f"The isolated candidate workspace is unavailable: {error}") from error
+        if candidate.is_symlink() or _is_junction(candidate, details):
+            raise HarnessError("The isolated candidate workspace cannot be a symbolic link or junction")
     return candidate
 
 
@@ -787,10 +1028,14 @@ def _validate_workspace_links(
     projected_workspace: Path | None = None,
     projected_excluded: tuple[Path, ...] = (),
 ) -> None:
-    root = workspace.resolve()
-    excluded = tuple(path.resolve() for path in excluded)
-    projected_root = projected_workspace.resolve() if projected_workspace is not None else None
-    projected_excluded = tuple(path.resolve() for path in projected_excluded)
+    root = _real_directory_root(workspace, "Workspace")
+    excluded = tuple(Path(os.path.abspath(path)) for path in excluded)
+    projected_root = (
+        _real_directory_root(projected_workspace, "Projected workspace")
+        if projected_workspace is not None
+        else None
+    )
+    projected_excluded = tuple(Path(os.path.abspath(path)) for path in projected_excluded)
 
     def validate(path: Path) -> None:
         target = Path(os.readlink(path))
@@ -805,7 +1050,7 @@ def _validate_workspace_links(
         if resolved.is_dir():
             raise HarnessError(f"Directory workspace symlinks are not allowed in isolated runs: {path}")
         relative_target = resolved.relative_to(root)
-        if ".git" in relative_target.parts or _is_excluded(resolved, excluded):
+        if _contains_git_part(relative_target) or _is_excluded(resolved, excluded):
             raise HarnessError(f"Workspace symlink targets content omitted from isolated runs: {path}")
         if projected_root is None:
             return
@@ -814,7 +1059,7 @@ def _validate_workspace_links(
         if projected_target != projected_root and projected_root not in projected_target.parents:
             raise HarnessError(f"Workspace symlink escapes the promoted workspace: {path}")
         projected_relative = projected_target.relative_to(projected_root)
-        if ".git" in projected_relative.parts or any(
+        if _contains_git_part(projected_relative) or any(
             projected_target == item or item in projected_target.parents for item in projected_excluded
         ):
             raise HarnessError(f"Workspace symlink would expose protected formal-workspace content: {path}")
@@ -824,8 +1069,14 @@ def _validate_workspace_links(
         traversable: list[str] = []
         for name in subdirectories:
             path = base / name
-            if name == ".git" or _is_excluded(path, excluded):
+            if _is_git_name(name) or _is_excluded(path, excluded):
                 continue
+            try:
+                details = path.lstat()
+            except OSError as error:
+                raise HarnessError(f"Could not inspect workspace path {path}: {error}") from error
+            if _is_junction(path, details):
+                raise HarnessError(f"Directory workspace junctions are not allowed in isolated runs: {path}")
             if not path.is_symlink():
                 traversable.append(name)
                 continue
@@ -833,24 +1084,27 @@ def _validate_workspace_links(
         subdirectories[:] = traversable
         for name in files:
             path = base / name
-            if name == ".git" or _is_excluded(path, excluded) or not path.is_symlink():
+            if _is_git_name(name) or _is_excluded(path, excluded) or not path.is_symlink():
                 continue
             validate(path)
 
 
 def _workspace_manifest(workspace: Path, excluded: tuple[Path, ...] = ()) -> dict[str, Any]:
     """Create a content-addressed identity for the delivered workspace."""
-    workspace = workspace.resolve()
-    excluded = tuple(path.resolve() for path in excluded)
+    workspace = _real_directory_root(workspace, "Workspace")
+    excluded = tuple(Path(os.path.abspath(path)) for path in excluded)
     entries: list[dict[str, Any]] = []
     for directory, subdirectories, files in os.walk(workspace, followlinks=False):
         base = Path(directory)
         traversable: list[str] = []
         for name in sorted(subdirectories):
             path = base / name
-            if name == ".git" or _is_excluded(path, excluded):
+            if _is_git_name(name) or _is_excluded(path, excluded):
                 continue
             try:
+                details = path.lstat()
+                if _is_junction(path, details):
+                    raise HarnessError(f"Directory workspace junctions are not allowed in isolated runs: {path}")
                 if path.is_symlink():
                     entries.append(
                         {
@@ -861,7 +1115,6 @@ def _workspace_manifest(workspace: Path, excluded: tuple[Path, ...] = ()) -> dic
                         }
                     )
                 else:
-                    details = path.lstat()
                     if not stat.S_ISDIR(details.st_mode):
                         raise HarnessError(f"Unsupported workspace entry type: {path}")
                     entries.append(
@@ -877,7 +1130,7 @@ def _workspace_manifest(workspace: Path, excluded: tuple[Path, ...] = ()) -> dic
         subdirectories[:] = traversable
         for name in sorted(files):
             path = base / name
-            if name == ".git" or _is_excluded(path, excluded):
+            if _is_git_name(name) or _is_excluded(path, excluded):
                 continue
             try:
                 details = path.lstat()
@@ -917,11 +1170,45 @@ def _is_manifest_mix(current: dict[str, Any], before: dict[str, Any], after: dic
     before_entries = {entry["path"]: entry for entry in before.get("entries", [])}
     after_entries = {entry["path"]: entry for entry in after.get("entries", [])}
     paths = current_entries.keys() | before_entries.keys() | after_entries.keys()
-    return all(current_entries.get(path) in (before_entries.get(path), after_entries.get(path)) for path in paths)
+    temporary_name = re.compile(r"^\..+\.harness-promote-[0-9a-f]{6}$")
+    for path in paths:
+        current_entry = current_entries.get(path)
+        before_entry = before_entries.get(path)
+        after_entry = after_entries.get(path)
+        if current_entry in (before_entry, after_entry):
+            continue
+        if (
+            before_entry is None
+            and after_entry is None
+            and current_entry is not None
+            and temporary_name.fullmatch(Path(path).name)
+        ):
+            continue
+        if current_entry is None and before_entry != after_entry:
+            continue
+        if current_entry is not None and current_entry.get("kind") == "directory":
+            transient = False
+            for expected in (before_entry, after_entry):
+                if not isinstance(expected, dict) or expected.get("kind") != "directory":
+                    continue
+                writable_mode = (
+                    int(expected["mode"])
+                    | stat.S_IRUSR
+                    | stat.S_IWUSR
+                    | stat.S_IXUSR
+                )
+                if current_entry == {**expected, "mode": writable_mode}:
+                    transient = True
+                    break
+            if transient:
+                continue
+        return False
+    return True
 
 
 def _copy_workspace(workspace: Path, destination: Path, excluded: tuple[Path, ...] = ()) -> None:
-    excluded = tuple(path.resolve() for path in excluded)
+    workspace = _real_directory_root(workspace, "Source workspace")
+    excluded = tuple(Path(os.path.abspath(path)) for path in excluded)
     _validate_workspace_links(workspace, excluded)
 
     def ignore(directory: str, names: list[str]) -> set[str]:
@@ -929,7 +1216,7 @@ def _copy_workspace(workspace: Path, destination: Path, excluded: tuple[Path, ..
         return {
             name
             for name in names
-            if name == ".git" or _is_excluded(base / name, excluded)
+            if _is_git_name(name) or _is_excluded(base / name, excluded)
         }
 
     try:
@@ -949,14 +1236,17 @@ def _restore_workspace_if_changed(
         trusted_details = trusted_snapshot.lstat()
     except OSError as error:
         raise HarnessError(f"Trusted {actor.lower()} snapshot is unavailable: {error}") from error
-    if not stat.S_ISDIR(trusted_details.st_mode) or trusted_snapshot.is_symlink():
+    if (
+        not stat.S_ISDIR(trusted_details.st_mode)
+        or trusted_snapshot.is_symlink()
+        or _is_junction(trusted_snapshot, trusted_details)
+    ):
         raise HarnessError(f"Trusted {actor.lower()} snapshot is not a real directory")
     if _workspace_manifest(trusted_snapshot)["sha256"] != expected_id:
         raise HarnessError(f"Trusted {actor.lower()} snapshot changed")
 
     try:
-        details = workspace.lstat()
-        real_directory = stat.S_ISDIR(details.st_mode) and not workspace.is_symlink()
+        real_directory = _is_real_directory(workspace)
     except OSError:
         real_directory = False
     if real_directory:
@@ -1016,7 +1306,8 @@ def _run_verification(run_dir: Path, index: int, workspace: Path, config: dict[s
             raise HarnessError("Candidate changed while the deterministic verification snapshot was being created")
         for number, raw_command in enumerate(commands, start=1):
             command = list(raw_command)
-            command_text = shlex.join(command)
+            command_text = format_command(command)
+            launch_command = list(command)
             started = time.monotonic()
             timed_out = False
             paused = False
@@ -1024,58 +1315,96 @@ def _run_verification(run_dir: Path, index: int, workspace: Path, config: dict[s
             error_text = ""
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as log:
-                log_path.chmod(0o600)
+                set_private_permissions(log_path)
                 log.write(f"\n[{now()}] verification {number}\n$ {command_text}\n")
                 log.flush()
-                try:
-                    process = subprocess.Popen(
-                        command,
-                        cwd=verification_workspace,
-                        env=_isolated_process_environment(verification_workspace),
-                        stdin=subprocess.DEVNULL,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        start_new_session=True,
-                    )
-                except OSError as error:
+                executable = resolve_program(launch_command[0], cwd=verification_workspace)
+                if executable is None:
                     process = None
-                    error_text = str(error)
+                    error_text = f"Verification executable is unavailable: {launch_command[0]}"
                     log.write(error_text + "\n")
+                else:
+                    launch_command[0] = executable
+                    if _windows_batch_argv_has_metacharacters(launch_command):
+                        process = None
+                        error_text = (
+                            "Windows batch verification argv contains cmd.exe metacharacters; "
+                            "use a native executable or remove the metacharacters"
+                        )
+                        log.write(error_text + "\n")
+                    else:
+                        try:
+                            process = spawn_managed_process(
+                                launch_command,
+                                cwd=verification_workspace,
+                                env=_isolated_process_environment(verification_workspace),
+                                stdin=subprocess.DEVNULL,
+                                stdout=log,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                encoding="utf-8",
+                            )
+                        except OSError as error:
+                            process = None
+                            error_text = str(error)
+                            log.write(error_text + "\n")
+                        except RuntimeError as error:
+                            raise HarnessError(
+                                f"Could not launch deterministic verification safely: {error}"
+                            ) from error
                 if process is not None:
-                    _update_state(
-                        run_dir,
-                        active_agent={
+                    active_verifier: dict[str, Any] | None = None
+                    try:
+                        process_started = managed_process_start_time(process)
+                        if not process_started:
+                            raise HarnessError("Could not establish a safe process identity for deterministic verification")
+                        active_verifier = {
                             "profile": "harness",
                             "role": "DETERMINISTIC_VERIFIER",
                             "pid": process.pid,
                             "process_group": process.pid,
-                            "pid_started": pid_start_time(process.pid),
-                            "log": str(log_path.relative_to(run_dir)),
+                            "pid_started": process_started,
+                            "log": _run_relative(log_path, run_dir),
                             "started_at": now(),
-                        },
-                    )
-                    append_event(run_dir, "verification_started", command=command_text, pid=process.pid)
-                    deadline = time.monotonic() + timeout
-                    while process.poll() is None:
-                        if (run_dir / PAUSE_FILE).is_file():
-                            paused = True
+                        }
+                        _update_state(run_dir, active_agent=active_verifier)
+                        append_event(run_dir, "verification_started", command=command_text, pid=process.pid)
+                        deadline = time.monotonic() + timeout
+                        while process.poll() is None:
+                            if pause_requested(run_dir):
+                                paused = True
+                                _terminate(process)
+                                break
+                            if time.monotonic() >= deadline:
+                                timed_out = True
+                                _terminate(process)
+                                break
+                            time.sleep(0.1)
+                        returncode = process.wait()
+                        _terminate(process, grace=1.0)
+                        _update_state(run_dir, active_agent=None)
+                        append_event(
+                            run_dir,
+                            "verification_finished",
+                            command=command_text,
+                            returncode=returncode,
+                            timed_out=timed_out,
+                        )
+                    except BaseException:
+                        try:
                             _terminate(process)
-                            break
-                        if time.monotonic() >= deadline:
-                            timed_out = True
-                            _terminate(process)
-                            break
-                        time.sleep(0.1)
-                    returncode = process.wait()
-                    _update_state(run_dir, active_agent=None)
-                    append_event(
-                        run_dir,
-                        "verification_finished",
-                        command=command_text,
-                        returncode=returncode,
-                        timed_out=timed_out,
-                    )
+                        except BaseException:
+                            if active_verifier is not None:
+                                try:
+                                    _update_state(run_dir, active_agent=active_verifier)
+                                except (OSError, HarnessError):
+                                    pass
+                            raise
+                        try:
+                            _update_state(run_dir, active_agent=None)
+                        except (OSError, HarnessError):
+                            pass
+                        raise
             if paused:
                 raise OperatorPause("The deterministic verifier was stopped at the user's request.")
             try:
@@ -1093,7 +1422,7 @@ def _run_verification(run_dir: Path, index: int, workspace: Path, config: dict[s
                     "timed_out": timed_out,
                     "duration_seconds": round(time.monotonic() - started, 3),
                     "details": details.strip() or f"Command exited with status {returncode}.",
-                    "log": str(log_path.relative_to(run_dir)),
+                    "log": _run_relative(log_path, run_dir),
                 }
             )
     report = {
@@ -1164,16 +1493,47 @@ def _apply_verification_gate(audit: dict[str, Any], verification: dict[str, Any]
 
 
 def _remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
+    def retry_readonly(function: Any, value: str, error: Any) -> None:
+        target = Path(value)
+        if target.is_symlink() or _is_junction(target):
+            raise error[1]
+        try:
+            original = target.lstat()
+        except OSError:
+            raise error[1]
+        _make_writable(target)
+        try:
+            if function is os.scandir:
+                shutil.rmtree(target, onerror=retry_readonly)
+            else:
+                function(value)
+        except BaseException:
+            _restore_mode(target, original)
+            raise
+
+    if _is_junction(path):
+        path.rmdir()
+    elif path.is_symlink() or path.is_file():
+        try:
+            path.unlink()
+        except PermissionError:
+            if path.is_symlink():
+                raise
+            original = path.lstat()
+            _make_writable(path)
+            try:
+                path.unlink()
+            except BaseException:
+                _restore_mode(path, original)
+                raise
     elif path.is_dir():
-        shutil.rmtree(path)
+        shutil.rmtree(path, onerror=retry_readonly)
 
 
 def _sync_workspace(source: Path, destination: Path, excluded: tuple[Path, ...] = ()) -> dict[str, Any]:
-    source = source.resolve()
-    destination = destination.resolve()
-    excluded = tuple(path.resolve() for path in excluded)
+    source = _real_directory_root(source, "Source workspace")
+    destination = _real_directory_root(destination, "Destination workspace")
+    excluded = tuple(Path(os.path.abspath(path)) for path in excluded)
     _validate_workspace_links(
         source,
         projected_workspace=destination,
@@ -1184,9 +1544,10 @@ def _sync_workspace(source: Path, destination: Path, excluded: tuple[Path, ...] 
     source_entries = {entry["path"]: entry for entry in source_manifest["entries"]}
     destination_entries = {entry["path"]: entry for entry in destination_manifest["entries"]}
 
-    for relative, entry in destination_entries.items():
-        if entry["kind"] == "directory":
-            os.chmod(destination / relative, 0o700)
+    if not WINDOWS:
+        for relative, entry in destination_entries.items():
+            if entry["kind"] == "directory":
+                _make_writable(destination / relative)
 
     for relative in sorted(destination_entries.keys() - source_entries.keys(), key=lambda value: (-value.count("/"), value)):
         target = destination / relative
@@ -1202,12 +1563,18 @@ def _sync_workspace(source: Path, destination: Path, excluded: tuple[Path, ...] 
         target = destination / relative
         if _is_excluded(target, excluded):
             raise HarnessError(f"Candidate path collides with protected workspace data: {relative}")
-        if os.path.lexists(target) and (target.is_symlink() or not target.is_dir()):
+        if os.path.lexists(target) and (
+            target.is_symlink() or _is_junction(target) or not target.is_dir()
+        ):
             _remove_path(target)
         target.mkdir(parents=True, exist_ok=True)
+        if not WINDOWS:
+            os.chmod(target, int(_entry["mode"]) | stat.S_IWUSR)
 
     for relative, entry in sorted(source_entries.items()):
         if entry["kind"] == "directory":
+            continue
+        if destination_entries.get(relative) == entry:
             continue
         source_path = source / relative
         target = destination / relative
@@ -1216,18 +1583,20 @@ def _sync_workspace(source: Path, destination: Path, excluded: tuple[Path, ...] 
         current = destination
         for part in Path(relative).parts[:-1]:
             current /= part
-            if os.path.lexists(current) and (current.is_symlink() or not current.is_dir()):
+            if os.path.lexists(current) and (
+                current.is_symlink() or _is_junction(current) or not current.is_dir()
+            ):
                 _remove_path(current)
             current.mkdir(exist_ok=True)
         if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
+            _remove_path(target)
         temporary = target.with_name(f".{target.name}.harness-promote-{uuid.uuid4().hex[:6]}")
         try:
             if entry["kind"] == "link":
                 os.symlink(os.readlink(source_path), temporary)
             else:
                 shutil.copy2(source_path, temporary, follow_symlinks=False)
-            os.replace(temporary, target)
+            _replace_path(temporary, target)
         finally:
             if os.path.lexists(temporary):
                 _remove_path(temporary)
@@ -1263,7 +1632,7 @@ def _promote_candidate(run_dir: Path, accepted_artifact: dict[str, Any]) -> dict
             journal.get("status") == "prepared"
             and journal.get("base_artifact_id") == base.get("sha256")
             and journal.get("accepted_artifact_id") == accepted_id
-            and backup.is_dir()
+            and _is_real_directory(backup)
             and _workspace_manifest(backup)["sha256"] == base.get("sha256")
             and _is_manifest_mix(live_before, base, accepted_artifact)
         )
@@ -1275,7 +1644,7 @@ def _promote_candidate(run_dir: Path, accepted_artifact: dict[str, Any]) -> dict
         live_before = _workspace_manifest(live, exclusions)
         if live_before["sha256"] != base.get("sha256"):
             raise HarnessError("Could not restore the live workspace after interrupted promotion")
-    if not candidate.is_dir():
+    if not _is_real_directory(candidate):
         raise HarnessError("Accepted candidate workspace is unavailable for promotion")
     candidate_artifact = _workspace_manifest(candidate)
     if candidate_artifact["sha256"] != accepted_id:
@@ -1290,10 +1659,10 @@ def _promote_candidate(run_dir: Path, accepted_artifact: dict[str, Any]) -> dict
             _copy_workspace(live, temporary_backup, exclusions)
             if _workspace_manifest(temporary_backup)["sha256"] != base.get("sha256"):
                 raise HarnessError("Promotion backup does not match the original live workspace")
-            os.replace(temporary_backup, backup)
+            _replace_path(temporary_backup, backup)
         finally:
-            if temporary_backup.is_dir():
-                shutil.rmtree(temporary_backup)
+            if os.path.lexists(temporary_backup):
+                _remove_path(temporary_backup)
     if _workspace_manifest(backup)["sha256"] != base.get("sha256"):
         raise HarnessError("Promotion backup does not match the original live workspace")
     journal = {
@@ -1306,15 +1675,17 @@ def _promote_candidate(run_dir: Path, accepted_artifact: dict[str, Any]) -> dict
     write_json(journal_path, journal)
     try:
         promoted = _sync_workspace(candidate, live, exclusions)
-    except Exception as error:
+    except BaseException as error:
         try:
             _sync_workspace(backup, live, exclusions)
             journal.update({"status": "rolled_back", "error": str(error), "rolled_back_at": now()})
             write_json(journal_path, journal)
-        except Exception as rollback_error:
+        except BaseException as rollback_error:
             raise HarnessError(
                 f"Promotion failed and automatic rollback also failed; candidate and backup were preserved: {rollback_error}"
             ) from error
+        if not isinstance(error, Exception):
+            raise
         raise HarnessError(f"Candidate promotion failed and was rolled back: {error}") from error
     journal.update({"status": "complete", "completed_at": now()})
     write_json(journal_path, journal)
@@ -1346,9 +1717,13 @@ def _verify_worker_changes(run_dir: Path, index: int, result: dict[str, Any]) ->
     workspace = _candidate_workspace(run_dir)
     after = _workspace_manifest(workspace)
     write_json(iteration_dir / "output-artifact.json", after)
-    actual = set(_manifest_changes(before, after))
-    claimed = set(result["changed_files"])
-    unreported = sorted(actual - claimed)
+    actual_paths = _manifest_changes(before, after)
+
+    def identity(value: str) -> str:
+        return os.path.normcase(str(Path(value))) if WINDOWS else Path(value).as_posix()
+
+    claimed = {identity(value) for value in result["changed_files"]}
+    unreported = sorted(value for value in actual_paths if identity(value) not in claimed)
     if unreported:
         raise HarnessError("Worker omitted changed paths from its result: " + ", ".join(unreported[:20]))
 
@@ -1420,21 +1795,21 @@ def refresh_report(run_dir: Path) -> None:
         "- [Plan](PLAN.md)" if (run_dir / "PLAN.md").is_file() else "- Plan: pending",
     ]
     for path in sorted((run_dir / "iterations").glob("*/WORKER_RESULT.json")):
-        lines.append(f"- [{path.parent.name} worker result]({path.relative_to(run_dir)})")
+        lines.append(f"- [{path.parent.name} worker result]({_run_relative(path, run_dir)})")
     for path in sorted((run_dir / "iterations").glob("*/VERIFICATION.json")):
         try:
             verification = read_json(path)
             label = str(verification.get("status", "unknown"))
         except HarnessError:
             label = "invalid verification report"
-        lines.append(f"- [{path.parent.name} Harness verification]({path.relative_to(run_dir)}) — {label}")
+        lines.append(f"- [{path.parent.name} Harness verification]({_run_relative(path, run_dir)}) — {label}")
     for path in _audit_paths(run_dir):
         try:
             audit = read_json(path)
             label = f"{audit.get('verdict', 'UNKNOWN')} — {audit.get('summary', '')}"
         except HarnessError:
             label = "invalid audit"
-        lines.append(f"- [{path.parent.name} audit]({path.relative_to(run_dir)}) — {label}")
+        lines.append(f"- [{path.parent.name} audit]({_run_relative(path, run_dir)}) — {label}")
     if state.get("last_error"):
         lines.extend(["", "## Last error", "", str(state["last_error"])])
     lines.extend(
@@ -1472,51 +1847,77 @@ def refresh_report(run_dir: Path) -> None:
 
 
 def execute_run(run_dir: Path) -> int:
-    run_dir = run_dir.expanduser().resolve()
+    requested_run_dir = Path(os.path.abspath(run_dir.expanduser()))
+    if not _is_real_directory(requested_run_dir):
+        raise HarnessError(f"Not a real Harness run directory: {requested_run_dir}")
+    run_dir = requested_run_dir.resolve()
     state_path = run_dir / "state.json"
     config_path = run_dir / "run-config.json"
     if not state_path.is_file() or not config_path.is_file():
         raise HarnessError(f"Not a generic Harness run: {run_dir}")
-    state = read_json(state_path)
-    config = read_json(config_path)
-    if state.get("schema_version") != STATE_SCHEMA or config.get("schema_version") != STATE_SCHEMA:
-        raise HarnessError(f"Unsupported run format (legacy runs are not resumed by this runner): {run_dir}")
-    if str(state.get("status", "")).upper() in TERMINAL_STATUSES:
-        refresh_report(run_dir)
-        return 0 if state["status"] == "COMPLETE" else 1
 
     lock_path = run_dir / "run.lock"
-    with lock_path.open("a", encoding="utf-8") as lock:
+    with lock_path.open("a+b") as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquire_file_lock(lock, blocking=False)
         except BlockingIOError as error:
             raise HarnessError(f"Run already has an active supervisor: {run_dir}") from error
-        orphan_pid = active_agent_pid(state)
-        if orphan_pid:
+        state = read_json(state_path)
+        config = read_json(config_path)
+        if state.get("schema_version") != STATE_SCHEMA or config.get("schema_version") != STATE_SCHEMA:
+            raise HarnessError(f"Unsupported run format (legacy runs are not resumed by this runner): {run_dir}")
+        if str(state.get("status", "")).upper() in TERMINAL_STATUSES:
+            refresh_report(run_dir)
+            return 0 if state["status"] == "COMPLETE" else 1
+        orphan_status, orphan_pid = active_agent_identity(state)
+        if orphan_status == "unknown":
+            raise HarnessError(
+                "Run has a recorded child agent whose process identity cannot be verified; stop it safely before resuming"
+            )
+        if orphan_status == "match" and orphan_pid:
             raise HarnessError(
                 f"Run still has an active child agent (PID {orphan_pid}); stop it before resuming: {run_dir}"
             )
-        atomic_write(run_dir / "harness.pid", f"{os.getpid()}\n")
-        if (run_dir / PAUSE_FILE).is_file():
-            _update_state(run_dir, status="PAUSED", active_agent=None)
-            refresh_report(run_dir)
-            return 2
-        state = _update_state(
-            run_dir,
-            status="RUNNING",
-            active_agent=None,
-            last_error="",
-            started_at=state.get("started_at") or now(),
-        )
-        append_event(run_dir, "run_started", pid=os.getpid())
-        print(f"Run: {run_dir}", flush=True)
-        print(
-            f"Workspace: {state['workspace']} | worker={state['worker_agent']} | reviewer={state['reviewer_agent']}",
-            flush=True,
-        )
+        marker_path = supervisor_marker_path(run_dir)
+        marker_identity = write_process_marker(marker_path, os.getpid())
+        legacy_marker_path = run_dir / "harness.pid"
+        legacy_marker_identity = write_process_marker(legacy_marker_path, os.getpid())
+        if pause_requested(run_dir):
+            try:
+                _update_state(run_dir, status="PAUSED", active_agent=None)
+                refresh_report(run_dir)
+                return 2
+            finally:
+                remove_owned_process_marker(marker_path, marker_identity)
+                remove_owned_process_marker(legacy_marker_path, legacy_marker_identity)
+        try:
+            state = _update_state(
+                run_dir,
+                status="RUNNING",
+                active_agent=None,
+                last_error="",
+                started_at=state.get("started_at") or now(),
+            )
+            append_event(run_dir, "run_started", pid=os.getpid())
+            print(f"Run: {run_dir}", flush=True)
+            print(
+                f"Workspace: {state['workspace']} | worker={state['worker_agent']} | reviewer={state['reviewer_agent']}",
+                flush=True,
+            )
+        except KeyboardInterrupt:
+            try:
+                _update_state(run_dir, status="PAUSED", active_agent=None, last_error="Interrupted by the operator")
+            finally:
+                remove_owned_process_marker(marker_path, marker_identity)
+                remove_owned_process_marker(legacy_marker_path, legacy_marker_identity)
+            raise
+        except BaseException:
+            remove_owned_process_marker(marker_path, marker_identity)
+            remove_owned_process_marker(legacy_marker_path, legacy_marker_identity)
+            raise
         try:
             while True:
-                if (run_dir / PAUSE_FILE).is_file():
+                if pause_requested(run_dir):
                     raise OperatorPause("The run was paused by the user.")
                 state = read_json(state_path)
                 index = int(state.get("review_index", 0))
@@ -1550,7 +1951,7 @@ def execute_run(run_dir: Path) -> int:
                         status="COMPLETE",
                         active_agent=None,
                         artifact_id=accepted_id,
-                        artifact_path=str((review_dir / "artifact.json").relative_to(run_dir)),
+                        artifact_path=_run_relative(review_dir / "artifact.json", run_dir),
                         finished_at=now(),
                         last_error="",
                     )
@@ -1564,7 +1965,7 @@ def execute_run(run_dir: Path) -> int:
                     return 0
 
                 if state.get("phase") == "work":
-                    if not candidate_workspace.is_dir():
+                    if not _is_real_directory(candidate_workspace):
                         raise HarnessError("The isolated candidate workspace is unavailable")
                     _assert_live_workspace_unchanged(run_dir)
                     iteration_dir = run_dir / "iterations" / f"{index:02d}"
@@ -1606,8 +2007,10 @@ def execute_run(run_dir: Path) -> int:
                                 log_path=iteration_dir / "worker.log",
                                 timeout_seconds=timeout,
                                 workspace=candidate_workspace,
+                                guard=guard,
                             )
                         finally:
+                            agent_error = sys.exc_info()[1]
                             postcondition_errors: list[str] = []
                             try:
                                 _verify_control_guard(run_dir, guard)
@@ -1618,7 +2021,10 @@ def execute_run(run_dir: Path) -> int:
                             except HarnessError as error:
                                 postcondition_errors.append(str(error))
                             if postcondition_errors:
-                                raise HarnessError("; ".join(postcondition_errors))
+                                details = "; ".join(postcondition_errors)
+                                if agent_error is not None:
+                                    details = f"{agent_error}; {details}"
+                                raise HarnessError(details) from agent_error
                         try:
                             _archive_worker_result(run_dir, index)
                         except HarnessError:
@@ -1655,7 +2061,7 @@ def execute_run(run_dir: Path) -> int:
                 _quarantine(audit_path)
                 _update_state(run_dir, status="REVIEWING")
                 print(f"[{index + 1}] independent review with {reviewer_name}", flush=True)
-                if not candidate_workspace.is_dir():
+                if not _is_real_directory(candidate_workspace):
                     raise HarnessError("The isolated candidate workspace is unavailable")
                 _assert_live_workspace_unchanged(run_dir)
                 artifact_before = _workspace_manifest(candidate_workspace)
@@ -1708,8 +2114,10 @@ def execute_run(run_dir: Path) -> int:
                                 log_path=review_dir / "reviewer.log",
                                 timeout_seconds=timeout,
                                 workspace=review_workspace,
+                                guard=guard,
                             )
                         finally:
+                            agent_error = sys.exc_info()[1]
                             postcondition_errors = []
                             try:
                                 _verify_control_guard(run_dir, guard)
@@ -1729,7 +2137,10 @@ def execute_run(run_dir: Path) -> int:
                             except HarnessError as error:
                                 postcondition_errors.append(str(error))
                             if postcondition_errors:
-                                raise HarnessError("; ".join(postcondition_errors))
+                                details = "; ".join(postcondition_errors)
+                                if agent_error is not None:
+                                    details = f"{agent_error}; {details}"
+                                raise HarnessError(details) from agent_error
                 artifact_after = _workspace_manifest(candidate_workspace)
                 if artifact_after["sha256"] != artifact_before["sha256"]:
                     raise HarnessError("Candidate changed after review postconditions completed")
@@ -1767,25 +2178,30 @@ def execute_run(run_dir: Path) -> int:
                 _update_state(run_dir, phase="work", status="REPAIRING", review_index=index + 1)
                 refresh_report(run_dir)
         except OperatorPause as error:
-            _update_state(run_dir, status="PAUSED", active_agent=None, last_error=str(error))
+            _update_state(run_dir, status="PAUSED", last_error=str(error))
             append_event(run_dir, "run_paused", reason=str(error))
             refresh_report(run_dir)
             print(f"PAUSED: {run_dir}", flush=True)
             return 2
         except WorkerBlocked as error:
-            _update_state(run_dir, status="BLOCKED", active_agent=None, last_error=str(error))
+            _update_state(run_dir, status="BLOCKED", last_error=str(error))
             append_event(run_dir, "run_blocked", reason=str(error))
             refresh_report(run_dir)
             raise
         except HarnessError as error:
-            _update_state(run_dir, status="PAUSED", active_agent=None, last_error=str(error))
+            _update_state(run_dir, status="PAUSED", last_error=str(error))
             append_event(run_dir, "run_failed", error=str(error))
             refresh_report(run_dir)
             raise
+        except KeyboardInterrupt as error:
+            _update_state(run_dir, status="PAUSED", last_error="Interrupted by the operator")
+            append_event(run_dir, "run_paused", reason="KeyboardInterrupt")
+            refresh_report(run_dir)
+            raise error
         finally:
             try:
-                if (run_dir / "harness.pid").read_text(encoding="utf-8").strip() == str(os.getpid()):
-                    (run_dir / "harness.pid").unlink(missing_ok=True)
+                remove_owned_process_marker(marker_path, marker_identity)
+                remove_owned_process_marker(legacy_marker_path, legacy_marker_identity)
             except OSError:
                 pass
 
@@ -1816,9 +2232,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_utf8_stdio()
     args = parse_args()
     if args.resume:
-        return execute_run(args.resume)
+        with file_lock(supervisor_launch_lock_path(args.resume)):
+            pass
+        supervisor_identity = (os.getpid(), pid_start_time(os.getpid()))
+        try:
+            return execute_run(args.resume)
+        finally:
+            remove_owned_process_marker(
+                supervisor_marker_path(args.resume), supervisor_identity
+            )
+            remove_owned_process_marker(args.resume / "harness.pid", supervisor_identity)
     run_dir = create_run(
         _request_from_args(args),
         config_path=args.config,

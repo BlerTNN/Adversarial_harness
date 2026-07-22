@@ -1,4 +1,6 @@
 import json
+import http.client
+import socket
 import tempfile
 import threading
 import unittest
@@ -135,6 +137,29 @@ class StatusDashboardTests(unittest.TestCase):
     def test_dashboard_refuses_non_loopback_binding(self):
         with self.assertRaisesRegex(ValueError, "localhost"):
             status_dashboard.make_server(Path.cwd(), "0.0.0.0", 0)
+
+    @unittest.skipUnless(socket.has_ipv6, "IPv6 is unavailable")
+    def test_dashboard_supports_ipv6_loopback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            try:
+                server = status_dashboard.make_server(Path(temporary), "::1", 0)
+            except OSError as error:
+                self.skipTest(f"IPv6 loopback is unavailable: {error}")
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection("::1", server.server_address[1], timeout=3)
+            try:
+                connection.request("GET", "/healthz")
+                response = connection.getresponse()
+                body = response.read()
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(body, status_dashboard.DASHBOARD_HEALTH)
 
 
 if __name__ == "__main__":
