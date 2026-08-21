@@ -10,6 +10,10 @@ For example:
 
 After one task finishes, simply describe the next one. The workspace persists, each request creates a new run, and the root TUI does not need to restart.
 
+## Best fit
+
+This Harness is most useful for scaled delivery or repeated testing: many similar tasks, regression cycles, or agent/model comparisons that should all follow the same acceptance policy. Candidate isolation, deterministic checks, retained evidence, and independent review add some per-run overhead, but make results repeatable and auditable. For a one-off, low-risk edit, a single agent session may be simpler.
+
 ## Quick start
 
 From this directory, start any installed and authenticated CLI:
